@@ -1,0 +1,17 @@
+[Unit]
+Description=Playwright Watchdog
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/mohamed/detector-rdpbridge/playwright_watchdog.py --verbose
+Restart=always
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
+
+
+
+
