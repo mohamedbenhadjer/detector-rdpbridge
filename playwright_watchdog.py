@@ -1,488 +1,537 @@
 #!/usr/bin/env python3
 """
-Cross-platform Playwright watchdog that detects runs, discovers CDP, and logs failures.
-Works on Windows (WMI) and Linux (proc connector; falls back to /proc polling if not root).
-
-This tool does not wrap your Playwright command and does not edit your test code.
-Optionally pair with runtime injectors to ensure Chromium exposes a CDP port:
- - Node:   NODE_OPTIONS=--require /path/to/injectors/pw_injector.js
- - Python: PYTHONPATH=/path/to/injectors/pw_py_inject  (sitecustomize)
-
-Logs JSON lines to ~/.pw_watchdog/logs/watchdog.jsonl
+Cross-platform Playwright Watchdog with CDP support.
+Tracks Playwright process lifecycle, logs events as JSONL, and correlates artifacts.
 """
-import argparse
-import hashlib
-import json
+
 import os
-import platform
-import re
-import socket
 import sys
+import json
 import time
+import psutil
+import platform
 import threading
-from datetime import datetime
+import logging
+import re
 from pathlib import Path
-from typing import Dict, Optional, Any
+from typing import Optional, Dict, Any, List
+from dataclasses import dataclass, asdict
+from datetime import datetime
+import signal
 
+# Load .env if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-# Detection patterns for Playwright invocations
-PLAYWRIGHT_PATTERNS = [
-    r"\bplaywright\b",
-    r"@playwright/test",
-    r"\bnpx\b\s+playwright\b",
-    r"\bnode\b.*@playwright/test",
-    r"\bpytest\b.*playwright",
-    r"\bpython\b.*playwright",
-    r"\b(chromium|chrome|chrome-stable)\b.*--remote-debugging-port",
+# Configuration from environment
+WATCHDOG_DIR = Path(os.getenv('PW_WATCHDOG_DIR', Path.home() / '.pw_watchdog'))
+LOG_DIR = WATCHDOG_DIR / 'logs'
+CDP_DIR = WATCHDOG_DIR / 'cdp'
+REPORTS_DIR = WATCHDOG_DIR / 'reports'
+TMP_DIR = WATCHDOG_DIR / 'tmp'
+
+POLL_INTERVAL = float(os.getenv('PW_WATCHDOG_POLL_INTERVAL', '0.5'))
+LOG_MAX_SIZE = int(os.getenv('PW_WATCHDOG_LOG_MAX_SIZE', str(10 * 1024 * 1024)))  # 10MB
+LOG_BACKUPS = int(os.getenv('PW_WATCHDOG_LOG_BACKUPS', '5'))
+STDOUT_LOGGING = os.getenv('PW_WATCHDOG_STDOUT', '1') == '1'
+USE_NETLINK = os.getenv('PW_WATCHDOG_USE_NETLINK', 'auto')
+
+# Process detection patterns
+NODE_PATTERNS = [
+    r'node.*playwright.*test',
+    r'npx\s+playwright\s+test',
+    r'playwright\s+test',
+]
+PYTHON_PATTERNS = [
+    r'pytest.*playwright',
+    r'pytest.*--browser',
+    r'python.*-m\s+pytest.*playwright',
 ]
 
-
-WATCHDOG_DIR = Path.home() / ".pw_watchdog"
-CDP_DIR = WATCHDOG_DIR / "cdp"
-REPORTS_DIR = WATCHDOG_DIR / "reports"
-LOGS_DIR = WATCHDOG_DIR / "logs"
-LOG_FILE = LOGS_DIR / "watchdog.jsonl"
-
-
-def ensure_dirs():
-    CDP_DIR.mkdir(parents=True, exist_ok=True)
-    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def get_username() -> str:
-    try:
-        return os.getlogin()
-    except Exception:
-        return os.environ.get("USER", os.environ.get("USERNAME", "unknown"))
+@dataclass
+class ProcessInfo:
+    pid: int
+    ppid: int
+    cmdline: List[str]
+    cwd: str
+    user: str
+    start_time: float
+    run_id: Optional[str] = None
+    engine: Optional[str] = None
+    cdp_info: Optional[Dict[str, Any]] = None
 
 
-class PlaywrightRun:
-    def __init__(self, pid: int, cmdline: str, cwd: str, user: str, ppid: Optional[int] = None):
-        self.pid = pid
-        self.ppid = ppid
-        self.cmdline = cmdline
-        self.cwd = cwd
-        self.user = user
-        self.ts_start = time.time()
-        self.run_id = self._generate_run_id(pid)
-        self.cdp: Optional[Dict[str, Any]] = None
+class RotatingJSONLHandler:
+    """Simple size-based rotating JSONL file handler."""
+    
+    def __init__(self, filepath: Path, max_size: int, backup_count: int):
+        self.filepath = filepath
+        self.max_size = max_size
+        self.backup_count = backup_count
+        self.filepath.parent.mkdir(parents=True, exist_ok=True)
+        
+    def write(self, event: Dict[str, Any]):
+        """Write JSON event and rotate if needed."""
+        line = json.dumps(event, default=str) + '\n'
+        
+        # Check size and rotate if needed
+        if self.filepath.exists() and self.filepath.stat().st_size + len(line) > self.max_size:
+            self._rotate()
+        
+        with open(self.filepath, 'a') as f:
+            f.write(line)
+            
+    def _rotate(self):
+        """Rotate log files."""
+        for i in range(self.backup_count - 1, 0, -1):
+            old = self.filepath.with_suffix(f'.jsonl.{i}')
+            new = self.filepath.with_suffix(f'.jsonl.{i + 1}')
+            if old.exists():
+                old.replace(new)
+        
+        if self.filepath.exists():
+            self.filepath.replace(self.filepath.with_suffix('.jsonl.1'))
 
-    def _generate_run_id(self, pid: int) -> str:
-        data = f"{pid}:{self.ts_start}".encode("utf-8")
-        return hashlib.sha256(data).hexdigest()[:16]
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "runId": self.run_id,
-            "pid": self.pid,
-            "ppid": self.ppid,
-            "cmdline": self.cmdline,
-            "cwd": self.cwd,
-            "user": self.user,
-        }
-
-
-class Logger:
-    def __init__(self, path: Path, verbose: bool):
-        self.path = path
-        self.verbose = verbose
+class PlaywrightWatchdog:
+    """Main watchdog service."""
+    
+    def __init__(self):
+        self.os_name = platform.system()
+        self.tracked_processes: Dict[int, ProcessInfo] = {}
         self.lock = threading.Lock()
-        ensure_dirs()
-
-    def log(self, event: str, data: Dict[str, Any]):
-        entry = {
-            "ts": datetime.utcnow().isoformat() + "Z",
-            "event": event,
-            "os": platform.system().lower(),
-            **data,
-        }
-        line = json.dumps(entry, ensure_ascii=False)
-        with self.lock:
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        if self.verbose or event in {"playwright_failed", "watchdog_error"}:
-            print(line, flush=True)
-
-
-def is_playwright_process(cmdline: str, comm: str = "") -> bool:
-    hay = f"{comm} {cmdline}".lower()
-    return any(re.search(p, hay) for p in PLAYWRIGHT_PATTERNS)
-
-
-class CDPDiscovery:
-    @staticmethod
-    def from_pid_file(pid: int) -> Optional[Dict[str, Any]]:
-        path = CDP_DIR / f"{pid}.json"
-        if not path.exists():
-            return None
+        self.running = False
+        self.logger = self._setup_logging()
+        self.jsonl_handler = RotatingJSONLHandler(
+            LOG_DIR / 'watchdog.jsonl',
+            LOG_MAX_SIZE,
+            LOG_BACKUPS
+        )
+        
+        # Ensure runtime directories exist
+        for directory in [LOG_DIR, CDP_DIR, REPORTS_DIR, TMP_DIR]:
+            directory.mkdir(parents=True, exist_ok=True)
+        
+        self.logger.info(f"Watchdog initialized on {self.os_name}")
+        
+    def _setup_logging(self) -> logging.Logger:
+        """Setup Python logging for internal watchdog logs."""
+        logger = logging.getLogger('playwright_watchdog')
+        logger.setLevel(logging.INFO)
+        
+        if STDOUT_LOGGING:
+            handler = logging.StreamHandler(sys.stdout)
+            handler.setFormatter(logging.Formatter(
+                '%(asctime)s [%(levelname)s] %(message)s'
+            ))
+            logger.addHandler(handler)
+        
+        return logger
+    
+    def _is_playwright_process(self, proc: psutil.Process) -> bool:
+        """Check if process is a Playwright run."""
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return None
-
-    @staticmethod
-    def from_cmdline(cmdline: str) -> Optional[Dict[str, Any]]:
-        m = re.search(r"--remote-debugging-port[=\s]+(\d+)", cmdline)
-        if not m:
-            return None
-        port = int(m.group(1))
-        info: Dict[str, Any] = {"port": port}
-        # Try to resolve ws URL
+            cmdline = ' '.join(proc.cmdline())
+            
+            # Check Node patterns
+            for pattern in NODE_PATTERNS:
+                if re.search(pattern, cmdline, re.IGNORECASE):
+                    return True
+            
+            # Check Python patterns
+            for pattern in PYTHON_PATTERNS:
+                if re.search(pattern, cmdline, re.IGNORECASE):
+                    return True
+            
+            return False
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return False
+    
+    def _extract_run_id(self, proc: psutil.Process) -> str:
+        """Extract or generate runId for a process."""
         try:
-            import urllib.request
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1) as resp:
-                meta = json.loads(resp.read().decode("utf-8", "replace"))
-            info["wsUrl"] = meta.get("webSocketDebuggerUrl")
-        except Exception:
-            info["wsUrl"] = None
-        return info
-
-
-class Artifacts:
-    @staticmethod
-    def read_playwright_test_json(key: str) -> Optional[Dict[str, Any]]:
-        # key can be runId or pid; we try both
-        for name in (f"{key}.json", f"{key}.report.json"):
-            path = REPORTS_DIR / name
-            if not path.exists():
-                continue
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                errors = []
-                artifacts: Dict[str, Any] = {"reportFile": str(path)}
-                for suite in data.get("suites", []):
-                    for spec in suite.get("specs", []):
-                        for test in spec.get("tests", []):
-                            for res in test.get("results", []):
-                                if res.get("status") in ("failed", "timedOut"):
-                                    err = res.get("error", {}) or {}
-                                    errors.append({
-                                        "title": test.get("title"),
-                                        "message": err.get("message", ""),
-                                        "stack": err.get("stack", ""),
-                                    })
-                                    for att in res.get("attachments", []):
-                                        n = att.get("name")
-                                        p = att.get("path")
-                                        if not p:
-                                            continue
-                                        if n == "trace":
-                                            artifacts.setdefault("traceZip", []).append(p)
-                                        elif n == "screenshot":
-                                            artifacts.setdefault("screenshots", []).append(p)
-                                        elif n == "video":
-                                            artifacts["video"] = p
-                return {"errors": errors, "artifacts": artifacts}
-            except Exception:
-                continue
-        return None
-
-    @staticmethod
-    def read_pytest_junit(key: str) -> Optional[Dict[str, Any]]:
-        for name in (f"{key}.xml", f"{key}.junit.xml"):
-            path = REPORTS_DIR / name
-            if not path.exists():
-                continue
-            try:
-                import xml.etree.ElementTree as ET
-                tree = ET.parse(path)
-                root = tree.getroot()
-                errors = []
-                for tc in root.iter("testcase"):
-                    for tag in ("failure", "error"):
-                        elem = tc.find(tag)
-                        if elem is not None:
-                            errors.append({
-                                "title": f"{tc.get('classname')}.{tc.get('name')}",
-                                "message": elem.get("message", ""),
-                                "stack": elem.text or "",
-                            })
-                return {"errors": errors, "artifacts": {"reportFile": str(path)}}
-            except Exception:
-                continue
-        return None
-
-
-# ---------------- Windows ---------------- #
-def run_windows(logger: Logger, log_success: bool):
-    try:
-        import wmi  # type: ignore
-    except Exception:
-        logger.log("watchdog_error", {"message": "Windows mode requires 'wmi' and 'pywin32' (pip install wmi pywin32)"})
-        sys.exit(1)
-
-    c = wmi.WMI()
-    start_w = c.watch_for(notification_type="Creation", wmi_class="Win32_ProcessStartTrace")
-    stop_w = c.watch_for(notification_type="Deletion", wmi_class="Win32_ProcessStopTrace")
-
-    tracked: Dict[int, PlaywrightRun] = {}
-    logger.log("watchdog_started", {"mode": "windows_wmi", "user": get_username()})
-
-    while True:
-        try:
-            try:
-                ev = start_w(timeout_ms=200)
-            except wmi.x_wmi_timed_out:  # type: ignore
-                ev = None
-            if ev is not None:
-                pid = int(ev.ProcessID)
-                name = (ev.ProcessName or "").strip()
-                cmdline = name
-                ppid = None
-                cwd = os.getcwd()
-                try:
-                    proc = c.Win32_Process(ProcessId=pid)[0]
-                    cmdline = proc.CommandLine or name
-                    ppid = int(proc.ParentProcessId)
-                    # Approximate cwd from ExecutablePath
-                    if proc.ExecutablePath:
-                        cwd = str(Path(proc.ExecutablePath).parent)
-                except Exception:
-                    pass
-                if is_playwright_process(cmdline, name):
-                    run = PlaywrightRun(pid, cmdline, cwd, get_username(), ppid)
-                    run.cdp = CDPDiscovery.from_cmdline(cmdline) or CDPDiscovery.from_pid_file(pid)
-                    tracked[pid] = run
-                    payload = run.to_dict()
-                    if run.cdp:
-                        payload["cdp"] = run.cdp
-                    logger.log("playwright_started", payload)
-
-            try:
-                ev = stop_w(timeout_ms=200)
-            except wmi.x_wmi_timed_out:  # type: ignore
-                ev = None
-            if ev is not None:
-                pid = int(getattr(ev, "ProcessID", 0))
-                exit_code = int(getattr(ev, "ExitStatus", -1))
-                run = tracked.pop(pid, None)
-                if run is not None:
-                    duration_ms = int((time.time() - run.ts_start) * 1000)
-                    data = {**run.to_dict(), "exitCode": exit_code, "durationMs": duration_ms}
-                    if exit_code != 0:
-                        # Attach artifacts if user configured reporters to write here
-                        artifacts = Artifacts.read_playwright_test_json(run.run_id) or Artifacts.read_playwright_test_json(str(pid))
-                        if not artifacts:
-                            artifacts = Artifacts.read_pytest_junit(run.run_id) or Artifacts.read_pytest_junit(str(pid))
-                        if artifacts:
-                            data.update(artifacts)
-                        if run.cdp:
-                            data["cdp"] = run.cdp
-                        logger.log("playwright_failed", data)
-                    elif log_success:
-                        logger.log("playwright_succeeded", data)
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            logger.log("watchdog_error", {"message": f"windows loop error: {e}"})
-
-
-# ---------------- Linux ---------------- #
-def run_linux(logger: Logger, log_success: bool, poll_interval: float):
-    if os.geteuid() == 0:
-        try:
-            run_linux_proc_connector(logger, log_success)
-            return
-        except Exception as e:
-            logger.log("watchdog_error", {"message": f"proc connector failed, falling back to polling: {e}"})
-    run_linux_poll(logger, log_success, poll_interval)
-
-
-def run_linux_proc_connector(logger: Logger, log_success: bool):
-    import socket as pysocket
-    import struct
-
-    NETLINK_CONNECTOR = 11
-    CN_IDX_PROC = 0x1
-    CN_VAL_PROC = 0x1
-    NLMSG_DONE = 0x3
-    PROC_CN_MCAST_LISTEN = 1
-    PROC_CN_MCAST_IGNORE = 2
-    PROC_EVENT_EXEC = 2
-    PROC_EVENT_EXIT = 9
-
-    NLHDR = "=IHHII"
-    CNHDR = "=IIIIHH"
-    EVTHDR = "=IIQ"
-    EXECF = "=II"
-    EXITF = "=IIII"
-
-    def subscribe(sock, pid, op):
-        nl_len = struct.calcsize(NLHDR) + struct.calcsize(CNHDR) + 4
-        nlh = struct.pack(NLHDR, nl_len, NLMSG_DONE, 0, 0, pid)
-        cn = struct.pack("=II", CN_IDX_PROC, CN_VAL_PROC) + struct.pack("=II", 0, 0) + struct.pack("=H", 4) + struct.pack("=H", 0)
-        sock.send(nlh + cn + struct.pack("=I", op))
-
-    def read_cmd(pid: int) -> str:
-        try:
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                parts = [p.decode("utf-8", "replace") for p in f.read().split(b"\x00") if p]
-                return " ".join(parts)
-        except Exception:
-            return ""
-
-    def read_comm(pid: int) -> str:
-        try:
-            return open(f"/proc/{pid}/comm", "r", encoding="utf-8").read().strip()
-        except Exception:
-            return ""
-
-    def read_cwd(pid: int) -> str:
-        try:
-            return os.readlink(f"/proc/{pid}/cwd")
-        except Exception:
-            return os.getcwd()
-
-    sock = pysocket.socket(pysocket.AF_NETLINK, pysocket.SOCK_DGRAM, NETLINK_CONNECTOR)
-    sock.bind((os.getpid(), 0))
-    subscribe(sock, os.getpid(), PROC_CN_MCAST_LISTEN)
-
-    tracked: Dict[int, PlaywrightRun] = {}
-    logger.log("watchdog_started", {"mode": "linux_proc_connector", "user": get_username()})
-
-    try:
-        while True:
-            data = sock.recv(65536)
-            off = 0
-            while off + struct.calcsize(NLHDR) <= len(data):
-                nl_len, nl_type, nl_flags, nl_seq, nl_pid = struct.unpack_from(NLHDR, data, off)
-                if nl_len < struct.calcsize(NLHDR):
-                    break
-                blob = data[off + struct.calcsize(NLHDR): off + nl_len]
-                off += nl_len if nl_len > 0 else len(data)
-                if len(blob) < struct.calcsize(CNHDR):
-                    continue
-                idx, val, seq, ack, clen, cflags = struct.unpack_from(CNHDR, blob, 0)
-                cdata = blob[struct.calcsize(CNHDR): struct.calcsize(CNHDR) + clen]
-                if len(cdata) < struct.calcsize(EVTHDR):
-                    continue
-                what, cpu, ts_ns = struct.unpack_from(EVTHDR, cdata, 0)
-                payload = cdata[struct.calcsize(EVTHDR):]
-                if what == PROC_EVENT_EXEC and len(payload) >= struct.calcsize(EXECF):
-                    pid, tgid = struct.unpack_from(EXECF, payload, 0)
-                    cmd = read_cmd(tgid)
-                    comm = read_comm(tgid)
-                    if is_playwright_process(cmd, comm):
-                        run = PlaywrightRun(tgid, cmd, read_cwd(tgid), get_username())
-                        run.cdp = CDPDiscovery.from_cmdline(cmd) or CDPDiscovery.from_pid_file(tgid)
-                        tracked[tgid] = run
-                        data_out = run.to_dict()
-                        if run.cdp:
-                            data_out["cdp"] = run.cdp
-                        logger.log("playwright_started", data_out)
-                elif what == PROC_EVENT_EXIT and len(payload) >= struct.calcsize(EXITF):
-                    pid, tgid, exit_code, exit_signal = struct.unpack_from(EXITF, payload, 0)
-                    status = (exit_code >> 8) & 0xFF
-                    run = tracked.pop(tgid, None)
-                    if run:
-                        duration_ms = int((time.time() - run.ts_start) * 1000)
-                        data_out = {**run.to_dict(), "exitCode": status, "exitSignal": exit_signal, "durationMs": duration_ms}
-                        if status != 0:
-                            artifacts = Artifacts.read_playwright_test_json(run.run_id) or Artifacts.read_playwright_test_json(str(tgid))
-                            if not artifacts:
-                                artifacts = Artifacts.read_pytest_junit(run.run_id) or Artifacts.read_pytest_junit(str(tgid))
-                            if artifacts:
-                                data_out.update(artifacts)
-                            if run.cdp:
-                                data_out["cdp"] = run.cdp
-                            logger.log("playwright_failed", data_out)
-                        elif log_success:
-                            logger.log("playwright_succeeded", data_out)
-    finally:
-        try:
-            subscribe(sock, os.getpid(), PROC_CN_MCAST_IGNORE)
-        except Exception:
+            # Check environment variable
+            env = proc.environ()
+            if 'PW_WATCHDOG_RUN_ID' in env:
+                return env['PW_WATCHDOG_RUN_ID']
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
-
-
-def run_linux_poll(logger: Logger, log_success: bool, poll_interval: float):
-    logger.log("watchdog_started", {"mode": "linux_polling", "user": get_username(), "note": "Limited fidelity; run as root for exit codes"})
-    tracked: Dict[int, PlaywrightRun] = {}
-    seen: set[int] = set()
-    while True:
+        
+        # Generate from pid and start time
+        start_time_ms = int(proc.create_time() * 1000)
+        return f"{proc.pid}-{start_time_ms}"
+    
+    def _get_process_info(self, proc: psutil.Process) -> Optional[ProcessInfo]:
+        """Extract detailed process information."""
         try:
-            current: set[int] = set()
-            for pid_str in os.listdir("/proc"):
-                if not pid_str.isdigit():
-                    continue
-                pid = int(pid_str)
-                current.add(pid)
-                if pid in tracked:
-                    continue
-                # Read cmdline
-                cmd = ""
+            return ProcessInfo(
+                pid=proc.pid,
+                ppid=proc.ppid(),
+                cmdline=proc.cmdline(),
+                cwd=proc.cwd(),
+                user=proc.username(),
+                start_time=proc.create_time()
+            )
+        except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+            self.logger.warning(f"Failed to get info for pid {proc.pid}: {e}")
+            return None
+    
+    def _read_cdp_info(self, run_id: str) -> Optional[Dict[str, Any]]:
+        """Read CDP metadata written by injector."""
+        cdp_file = CDP_DIR / f"{run_id}.json"
+        
+        # Poll for a few seconds in case injector is still writing
+        for _ in range(10):
+            if cdp_file.exists():
                 try:
-                    with open(f"/proc/{pid}/cmdline", "rb") as f:
-                        parts = [p.decode("utf-8", "replace") for p in f.read().split(b"\x00") if p]
-                        cmd = " ".join(parts)
-                except Exception:
-                    continue
-                comm = ""
+                    with open(cdp_file) as f:
+                        return json.load(f)
+                except (json.JSONDecodeError, IOError) as e:
+                    self.logger.warning(f"Failed to read CDP info: {e}")
+                    return None
+            time.sleep(0.5)
+        
+        return None
+    
+    def _detect_engine(self, proc_info: ProcessInfo) -> str:
+        """Detect browser engine from command line."""
+        cmdline = ' '.join(proc_info.cmdline)
+        
+        if '--browser=chromium' in cmdline or 'chromium' in cmdline.lower():
+            return 'chromium'
+        elif '--browser=firefox' in cmdline or 'firefox' in cmdline.lower():
+            return 'firefox'
+        elif '--browser=webkit' in cmdline or 'webkit' in cmdline.lower():
+            return 'webkit'
+        
+        # Default to chromium for most Playwright runs
+        return 'chromium'
+    
+    def _emit_event(self, event: Dict[str, Any]):
+        """Emit JSONL event to log file and optionally stdout."""
+        event['ts'] = datetime.utcnow().isoformat() + 'Z'
+        
+        self.jsonl_handler.write(event)
+        
+        if STDOUT_LOGGING:
+            print(json.dumps(event, default=str))
+    
+    def _on_process_start(self, proc: psutil.Process):
+        """Handle Playwright process start."""
+        proc_info = self._get_process_info(proc)
+        if not proc_info:
+            return
+        
+        run_id = self._extract_run_id(proc)
+        proc_info.run_id = run_id
+        proc_info.engine = self._detect_engine(proc_info)
+        
+        with self.lock:
+            self.tracked_processes[proc.pid] = proc_info
+        
+        self.logger.info(f"Playwright started: pid={proc.pid}, runId={run_id}")
+        
+        # Try to read CDP info (may not be available immediately)
+        threading.Thread(
+            target=self._emit_start_event_async,
+            args=(proc_info,),
+            daemon=True
+        ).start()
+    
+    def _emit_start_event_async(self, proc_info: ProcessInfo):
+        """Emit start event after attempting to read CDP info."""
+        cdp_info = self._read_cdp_info(proc_info.run_id)
+        proc_info.cdp_info = cdp_info
+        
+        event = {
+            'event': 'playwright_started',
+            'runId': proc_info.run_id,
+            'os': self.os_name,
+            'pid': proc_info.pid,
+            'ppid': proc_info.ppid,
+            'cmdline': proc_info.cmdline,
+            'cwd': proc_info.cwd,
+            'user': proc_info.user,
+            'engine': proc_info.engine,
+        }
+        
+        if cdp_info:
+            event['cdp'] = cdp_info
+        
+        self._emit_event(event)
+    
+    def _parse_artifacts(self, proc_info: ProcessInfo) -> Dict[str, Any]:
+        """Parse artifacts from report files."""
+        artifacts = {}
+        
+        # Try to find report file
+        report_file = None
+        
+        # Check for Node JSON report
+        json_report = REPORTS_DIR / f"{proc_info.run_id}.json"
+        if json_report.exists():
+            report_file = str(json_report)
+            artifacts['reportFile'] = report_file
+            
+            # Parse Playwright Test JSON report for failures
+            try:
+                with open(json_report) as f:
+                    report_data = json.load(f)
+                    
+                # Extract trace/screenshot paths if present
+                if 'suites' in report_data:
+                    for suite in report_data.get('suites', []):
+                        for spec in suite.get('specs', []):
+                            for test in spec.get('tests', []):
+                                for result in test.get('results', []):
+                                    if result.get('status') == 'failed':
+                                        # Collect attachments
+                                        for attachment in result.get('attachments', []):
+                                            name = attachment.get('name', '')
+                                            path = attachment.get('path', '')
+                                            
+                                            if 'trace' in name.lower() and path:
+                                                artifacts.setdefault('traces', []).append(path)
+                                            elif 'screenshot' in name.lower() and path:
+                                                artifacts.setdefault('screenshots', []).append(path)
+                                            elif 'video' in name.lower() and path:
+                                                artifacts['video'] = path
+            except (json.JSONDecodeError, IOError, KeyError) as e:
+                self.logger.warning(f"Failed to parse JSON report: {e}")
+        
+        # Check for Python JUnit XML report
+        xml_report = REPORTS_DIR / f"{proc_info.run_id}.xml"
+        if xml_report.exists():
+            report_file = str(xml_report)
+            artifacts['reportFile'] = report_file
+        
+        return artifacts
+    
+    def _extract_error_summary(self, proc_info: ProcessInfo, exit_code: int) -> Optional[Dict[str, Any]]:
+        """Extract error summary from report if available."""
+        json_report = REPORTS_DIR / f"{proc_info.run_id}.json"
+        
+        if json_report.exists():
+            try:
+                with open(json_report) as f:
+                    report_data = json.load(f)
+                    
+                # Find first failure
+                for suite in report_data.get('suites', []):
+                    for spec in suite.get('specs', []):
+                        for test in spec.get('tests', []):
+                            for result in test.get('results', []):
+                                if result.get('status') == 'failed':
+                                    error = result.get('error', {})
+                                    return {
+                                        'title': f"{spec.get('title', '')} > {test.get('title', '')}",
+                                        'message': error.get('message', ''),
+                                        'stack': error.get('stack', '')
+                                    }
+            except (json.JSONDecodeError, IOError, KeyError):
+                pass
+        
+        # Fallback: generic error based on exit code
+        if exit_code != 0:
+            return {
+                'title': 'Test failed',
+                'message': f'Process exited with code {exit_code}',
+                'stack': ''
+            }
+        
+        return None
+    
+    def _on_process_exit(self, pid: int, exit_code: int):
+        """Handle Playwright process exit."""
+        with self.lock:
+            proc_info = self.tracked_processes.pop(pid, None)
+        
+        if not proc_info:
+            return
+        
+        duration_ms = int((time.time() - proc_info.start_time) * 1000)
+        
+        self.logger.info(f"Playwright exited: pid={pid}, runId={proc_info.run_id}, exitCode={exit_code}")
+        
+        artifacts = self._parse_artifacts(proc_info)
+        
+        if exit_code == 0:
+            event = {
+                'event': 'playwright_succeeded',
+                'runId': proc_info.run_id,
+                'pid': pid,
+                'exitCode': exit_code,
+                'durationMs': duration_ms,
+                'artifacts': artifacts
+            }
+        else:
+            error = self._extract_error_summary(proc_info, exit_code)
+            event = {
+                'event': 'playwright_failed',
+                'runId': proc_info.run_id,
+                'pid': pid,
+                'exitCode': exit_code,
+                'durationMs': duration_ms,
+                'artifacts': artifacts
+            }
+            if error:
+                event['error'] = error
+        
+        self._emit_event(event)
+        
+        # Cleanup old CDP metadata
+        self._cleanup_old_cdp_files()
+    
+    def _cleanup_old_cdp_files(self):
+        """Remove CDP metadata files older than 24 hours."""
+        try:
+            cutoff = time.time() - (24 * 3600)
+            for cdp_file in CDP_DIR.glob('*.json'):
+                if cdp_file.stat().st_mtime < cutoff:
+                    cdp_file.unlink()
+        except OSError:
+            pass
+    
+    def _poll_processes(self):
+        """Poll-based process tracking (fallback)."""
+        known_pids = set()
+        
+        while self.running:
+            try:
+                current_pids = set()
+                
+                for proc in psutil.process_iter(['pid']):
+                    try:
+                        if self._is_playwright_process(proc):
+                            current_pids.add(proc.pid)
+                            
+                            if proc.pid not in known_pids:
+                                # New process
+                                self._on_process_start(proc)
+                                known_pids.add(proc.pid)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+                
+                # Check for terminated processes
+                terminated = known_pids - current_pids
+                for pid in terminated:
+                    # Try to get exit code (best effort)
+                    exit_code = -1
+                    try:
+                        proc = psutil.Process(pid)
+                        status = proc.status()
+                        if status == psutil.STATUS_ZOMBIE:
+                            exit_code = proc.wait(timeout=1)
+                    except:
+                        pass
+                    
+                    self._on_process_exit(pid, exit_code)
+                    known_pids.discard(pid)
+                
+            except Exception as e:
+                self.logger.error(f"Error in poll loop: {e}")
+            
+            time.sleep(POLL_INTERVAL)
+    
+    def _use_wmi_windows(self):
+        """Windows WMI-based process tracking."""
+        try:
+            import wmi
+            c = wmi.WMI()
+            
+            self.logger.info("Using Windows WMI for process tracking")
+            
+            # Watch for process creation
+            process_watcher = c.Win32_Process.watch_for("creation")
+            process_termination = c.Win32_ProcessStopTrace.watch_for("operation")
+            
+            while self.running:
                 try:
-                    comm = open(f"/proc/{pid}/comm", "r", encoding="utf-8").read().strip()
-                except Exception:
-                    pass
-                if not is_playwright_process(cmd, comm):
+                    # Check for new processes
+                    new_proc = process_watcher(timeout_ms=100)
+                    if new_proc:
+                        try:
+                            proc = psutil.Process(new_proc.ProcessId)
+                            if self._is_playwright_process(proc):
+                                self._on_process_start(proc)
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+                    
+                    # Check for terminated processes
+                    term_proc = process_termination(timeout_ms=100)
+                    if term_proc:
+                        pid = term_proc.ProcessId
+                        exit_code = getattr(term_proc, 'ExitStatus', -1)
+                        if pid in self.tracked_processes:
+                            self._on_process_exit(pid, exit_code)
+                
+                except wmi.x_wmi_timed_out:
                     continue
-                try:
-                    cwd = os.readlink(f"/proc/{pid}/cwd")
-                except Exception:
-                    cwd = os.getcwd()
-                run = PlaywrightRun(pid, cmd, cwd, get_username())
-                run.cdp = CDPDiscovery.from_cmdline(cmd) or CDPDiscovery.from_pid_file(pid)
-                tracked[pid] = run
-                out = run.to_dict()
-                if run.cdp:
-                    out["cdp"] = run.cdp
-                logger.log("playwright_started", out)
-
-            # Detect exits (no exit code available)
-            for pid, run in list(tracked.items()):
-                if pid not in current:
-                    duration_ms = int((time.time() - run.ts_start) * 1000)
-                    data_out = {**run.to_dict(), "exitCode": None, "durationMs": duration_ms}
-                    # Try artifacts
-                    artifacts = Artifacts.read_playwright_test_json(run.run_id) or Artifacts.read_playwright_test_json(str(pid))
-                    if not artifacts:
-                        artifacts = Artifacts.read_pytest_junit(run.run_id) or Artifacts.read_pytest_junit(str(pid))
-                    if artifacts:
-                        data_out.update(artifacts)
-                    if run.cdp:
-                        data_out["cdp"] = run.cdp
-                    # We can't distinguish success/failure; emit generic exit event
-                    logger.log("playwright_exited", data_out)
-                    tracked.pop(pid, None)
-
-            time.sleep(poll_interval)
+                except Exception as e:
+                    self.logger.error(f"WMI error: {e}")
+                    time.sleep(1)
+                    
+        except ImportError:
+            self.logger.warning("WMI not available, falling back to polling")
+            self._poll_processes()
+    
+    def _use_netlink_linux(self):
+        """Linux netlink proc connector (requires root)."""
+        try:
+            from pyroute2 import IPRoute
+            self.logger.info("Netlink process tracking not yet implemented, using polling")
+            self._poll_processes()
+        except ImportError:
+            self.logger.warning("pyroute2 not available, using polling")
+            self._poll_processes()
+    
+    def start(self):
+        """Start the watchdog service."""
+        self.running = True
+        self.logger.info("Watchdog service starting...")
+        
+        try:
+            if self.os_name == 'Windows':
+                self._use_wmi_windows()
+            elif self.os_name == 'Linux':
+                if USE_NETLINK == 'true' and os.geteuid() == 0:
+                    self._use_netlink_linux()
+                else:
+                    self.logger.info("Using polling-based process tracking")
+                    self._poll_processes()
+            else:
+                self.logger.info("Using polling-based process tracking")
+                self._poll_processes()
         except KeyboardInterrupt:
-            break
-        except Exception as e:
-            logger.log("watchdog_error", {"message": f"linux polling error: {e}"})
+            self.logger.info("Received interrupt signal")
+        finally:
+            self.stop()
+    
+    def stop(self):
+        """Stop the watchdog service."""
+        self.running = False
+        self.logger.info("Watchdog service stopped")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Detect Playwright runs system-wide and log start/exit with CDP.")
-    parser.add_argument("--verbose", action="store_true", help="Print logs to stdout in addition to file")
-    parser.add_argument("--log-success", action="store_true", help="Also log successful exits (when status=0)")
-    parser.add_argument("--poll-interval", type=float, default=1.0, help="Linux polling interval (seconds) when not root")
-    args = parser.parse_args()
-
-    ensure_dirs()
-    logger = Logger(LOG_FILE, verbose=args.verbose)
-
-    if sys.platform.startswith("win"):
-        run_windows(logger, args.log_success)
-    elif sys.platform.startswith("linux"):
-        run_linux(logger, args.log_success, args.poll_interval)
-    else:
-        logger.log("watchdog_error", {"message": f"unsupported OS: {sys.platform}"})
-        sys.exit(2)
+    """Main entry point."""
+    watchdog = PlaywrightWatchdog()
+    
+    # Handle signals
+    def signal_handler(signum, frame):
+        watchdog.stop()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    watchdog.start()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
 
 
