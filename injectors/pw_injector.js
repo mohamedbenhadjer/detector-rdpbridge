@@ -1,112 +1,199 @@
-/*
-  Playwright Node injector (preload) to ensure Chromium exposes a CDP port
-  and to persist the ws URL for the watchdog. Does not modify test code.
+/**
+ * Node.js Playwright CDP Injector
+ * 
+ * Patches chromium.launch() to force:
+ * - --remote-debugging-port=0 (ephemeral port)
+ * - headless: false
+ * 
+ * Discovers CDP WebSocket URL and writes metadata to ~/.pw_watchdog/cdp/<runId>.json
+ * 
+ * Usage: NODE_OPTIONS="--require /path/to/pw_injector.js" npx playwright test
+ */
 
-  Usage:
-    NODE_OPTIONS=--require /absolute/path/to/injectors/pw_injector.js npx playwright test
-*/
 const fs = require('fs');
-const os = require('os');
 const path = require('path');
-const http = require('http');
-const net = require('net');
+const os = require('os');
 
-const WATCHDOG_DIR = path.join(os.homedir(), '.pw_watchdog');
+const WATCHDOG_DIR = process.env.PW_WATCHDOG_DIR || path.join(os.homedir(), '.pw_watchdog');
 const CDP_DIR = path.join(WATCHDOG_DIR, 'cdp');
-fs.mkdirSync(CDP_DIR, { recursive: true });
 
-function envTrue(name) {
-  const v = process.env[name];
-  if (!v) return false;
-  return ['1', 'true', 'yes', 'on'].includes(String(v).toLowerCase());
+// Ensure CDP directory exists
+if (!fs.existsSync(CDP_DIR)) {
+  fs.mkdirSync(CDP_DIR, { recursive: true });
 }
 
-function getFreePort() {
+/**
+ * Generate or retrieve runId
+ */
+function getRunId() {
+  if (process.env.PW_WATCHDOG_RUN_ID) {
+    return process.env.PW_WATCHDOG_RUN_ID;
+  }
+  
+  // Generate from pid and timestamp
+  const startMs = Date.now();
+  return `${process.pid}-${startMs}`;
+}
+
+/**
+ * Parse DevToolsActivePort file to get CDP WebSocket URL
+ */
+function readDevToolsActivePort(userDataDir, maxRetries = 20, delayMs = 500) {
   return new Promise((resolve, reject) => {
-    const srv = net.createServer();
-    srv.listen(0, '127.0.0.1', () => {
-      const port = srv.address().port;
-      srv.close(() => resolve(port));
-    });
-    srv.on('error', reject);
-  });
-}
-
-function fetchWsUrl(port) {
-  return new Promise((resolve) => {
-    const req = http.get({ host: '127.0.0.1', port, path: '/json/version', timeout: 500 }, (res) => {
-      let data = '';
-      res.setEncoding('utf8');
-      res.on('data', (c) => (data += c));
-      res.on('end', () => {
+    let attempts = 0;
+    
+    const tryRead = () => {
+      attempts++;
+      const activePortPath = path.join(userDataDir, 'DevToolsActivePort');
+      
+      if (fs.existsSync(activePortPath)) {
         try {
-          const json = JSON.parse(data);
-          resolve(json.webSocketDebuggerUrl || null);
-        } catch (e) {
-          resolve(null);
+          const content = fs.readFileSync(activePortPath, 'utf-8').trim();
+          const lines = content.split('\n');
+          
+          if (lines.length >= 2) {
+            const port = parseInt(lines[0], 10);
+            const wsEndpoint = lines[1];
+            
+            resolve({
+              port,
+              wsUrl: `ws://127.0.0.1:${port}${wsEndpoint}`,
+              devtoolsActivePortPath: activePortPath
+            });
+            return;
+          }
+        } catch (err) {
+          // File might be in the process of being written
         }
-      });
-    });
-    req.on('error', () => resolve(null));
-    req.on('timeout', () => {
-      req.destroy();
-      resolve(null);
-    });
+      }
+      
+      if (attempts < maxRetries) {
+        setTimeout(tryRead, delayMs);
+      } else {
+        reject(new Error('DevToolsActivePort not found after retries'));
+      }
+    };
+    
+    tryRead();
   });
 }
 
-async function ensureCDPArgs(options) {
-  const opts = options || {};
-  const isHeadlessSet = Object.prototype.hasOwnProperty.call(opts, 'headless');
-  if (!isHeadlessSet && envTrue('PWDEBUG')) {
-    opts.headless = false;
-  }
-  const args = Array.isArray(opts.args) ? opts.args.slice() : [];
-  if (!args.some(a => /--remote-debugging-port(=|\s)\d+/.test(a))) {
-    const port = await getFreePort();
-    args.push(`--remote-debugging-port=${port}`);
-    opts.__pw_watchdog_port = port;
-  }
-  opts.args = args;
-  return opts;
-}
-
-async function writeCDPInfo(port) {
-  const wsUrl = port ? await fetchWsUrl(port) : null;
-  const out = { port, wsUrl };
-  const file = path.join(CDP_DIR, `${process.pid}.json`);
-  try { fs.writeFileSync(file, JSON.stringify(out), 'utf8'); } catch (_) {}
-}
-
-(function patchPlaywright() {
+/**
+ * Write CDP metadata to watchdog directory
+ */
+function writeCdpMetadata(runId, cdpInfo) {
+  const metadataPath = path.join(CDP_DIR, `${runId}.json`);
+  const metadata = {
+    runId,
+    ...cdpInfo,
+    timestamp: new Date().toISOString()
+  };
+  
   try {
-    const pw = require('playwright');
-    if (!pw || !pw.chromium) return;
-    const origLaunch = pw.chromium.launch.bind(pw.chromium);
-    const origLaunchPersist = pw.chromium.launchPersistentContext.bind(pw.chromium);
-
-    pw.chromium.launch = async function patchedLaunch(options) {
-      const opts = await ensureCDPArgs(options);
-      const browser = await origLaunch(opts);
-      if (opts.__pw_watchdog_port) {
-        writeCDPInfo(opts.__pw_watchdog_port);
-      }
-      return browser;
-    };
-
-    pw.chromium.launchPersistentContext = async function patchedLaunchPersist(userDataDir, options) {
-      const opts = await ensureCDPArgs(options);
-      const context = await origLaunchPersist(userDataDir, opts);
-      if (opts.__pw_watchdog_port) {
-        writeCDPInfo(opts.__pw_watchdog_port);
-      }
-      return context;
-    };
-  } catch (e) {
-    // Swallow errors to avoid breaking user runs
+    fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
+    console.log(`[pw_injector] CDP metadata written: ${metadataPath}`);
+  } catch (err) {
+    console.error(`[pw_injector] Failed to write CDP metadata: ${err.message}`);
   }
-})();
+}
 
+/**
+ * Patch Playwright's chromium.launch()
+ */
+function patchPlaywright() {
+  const runId = getRunId();
+  console.log(`[pw_injector] Injector loaded, runId: ${runId}`);
+  
+  // Hook into module loading to intercept Playwright
+  const Module = require('module');
+  const originalRequire = Module.prototype.require;
+  
+  Module.prototype.require = function (id) {
+    const module = originalRequire.apply(this, arguments);
+    
+    // Detect Playwright module
+    if (id === 'playwright' || id === '@playwright/test' || id.endsWith('/playwright')) {
+      try {
+        if (module.chromium && module.chromium.launch) {
+          const originalLaunch = module.chromium.launch;
+          
+          module.chromium.launch = async function (options = {}) {
+            console.log('[pw_injector] Patching chromium.launch()');
+            
+            // Force headless: false
+            options.headless = false;
+            
+            // Add remote debugging port
+            options.args = options.args || [];
+            if (!options.args.some(arg => arg.startsWith('--remote-debugging-port'))) {
+              options.args.push('--remote-debugging-port=0');
+            }
+            
+            console.log('[pw_injector] Launching Chromium with CDP enabled');
+            const browser = await originalLaunch.call(this, options);
+            
+            // Extract user data dir from browser context
+            try {
+              const context = browser._initializer || browser;
+              const userDataDir = context.userDataDir || context._userDataDir;
+              
+              if (userDataDir) {
+                // Read CDP info asynchronously
+                readDevToolsActivePort(userDataDir)
+                  .then(cdpInfo => {
+                    writeCdpMetadata(runId, cdpInfo);
+                  })
+                  .catch(err => {
+                    console.error(`[pw_injector] Failed to read CDP info: ${err.message}`);
+                  });
+              } else {
+                console.warn('[pw_injector] Could not determine user data directory');
+              }
+            } catch (err) {
+              console.error(`[pw_injector] Error extracting CDP info: ${err.message}`);
+            }
+            
+            return browser;
+          };
+          
+          // Also patch launchPersistentContext
+          if (module.chromium.launchPersistentContext) {
+            const originalLaunchPersistent = module.chromium.launchPersistentContext;
+            
+            module.chromium.launchPersistentContext = async function (userDataDir, options = {}) {
+              console.log('[pw_injector] Patching chromium.launchPersistentContext()');
+              
+              options.headless = false;
+              options.args = options.args || [];
+              if (!options.args.some(arg => arg.startsWith('--remote-debugging-port'))) {
+                options.args.push('--remote-debugging-port=0');
+              }
+              
+              const context = await originalLaunchPersistent.call(this, userDataDir, options);
+              
+              // Read CDP info
+              readDevToolsActivePort(userDataDir)
+                .then(cdpInfo => {
+                  writeCdpMetadata(runId, cdpInfo);
+                })
+                .catch(err => {
+                  console.error(`[pw_injector] Failed to read CDP info: ${err.message}`);
+                });
+              
+              return context;
+            };
+          }
+        }
+      } catch (err) {
+        console.error(`[pw_injector] Failed to patch Playwright: ${err.message}`);
+      }
+    }
+    
+    return module;
+  };
+}
 
+// Apply patches
+patchPlaywright();
 
 

@@ -1,0 +1,12 @@
+# Playwright Watchdog Dependencies
+
+psutil>=5.9.0
+python-dotenv>=1.0.0
+
+# Windows-specific (only needed on Windows)
+pywin32>=305; sys_platform == 'win32'
+
+# Optional: Linux netlink support (requires root)
+# pyroute2>=0.7.0; sys_platform == 'linux'
+
+
