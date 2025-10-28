@@ -9,6 +9,8 @@ export MINIAGENT_ENABLED=1
 export MINIAGENT_WS_URL="ws://127.0.0.1:8777/ws"
 export MINIAGENT_CLIENT="python-cdp-monitor"
 export MINIAGENT_COOLDOWN_SEC=20
+export MINIAGENT_DEBUG_PORT=9222
+export MINIAGENT_FORCE_DEBUG_PORT=1
 
 # IMPORTANT: Set your actual token here
 if [ -z "$MINIAGENT_TOKEN" ]; then

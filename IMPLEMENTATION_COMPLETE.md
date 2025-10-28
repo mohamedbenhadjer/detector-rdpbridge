@@ -98,10 +98,11 @@ We have successfully implemented a **zero-code-change** solution that automatica
 - ✅ Thread-safe communication
 
 ### Remote Debugging ✅
-- ✅ Auto-enables `--remote-debugging-port=0` for Chromium
-- ✅ Reads DevToolsActivePort file
+- ✅ Auto-enables `--remote-debugging-port=9222` for Chromium (configurable)
+- ✅ Forces consistent port for reliable CDP connections
 - ✅ Includes port in controlTarget payload
 - ✅ Enables Chrome DevTools Protocol (CDP) access
+- ✅ Configurable via `MINIAGENT_DEBUG_PORT` and `MINIAGENT_FORCE_DEBUG_PORT`
 
 ---
 
@@ -273,7 +274,7 @@ export MINIAGENT_REDACT_URLS=0                      # Redact URLs (default: 0)
 ## 🐛 Known Limitations
 
 1. **Firefox/WebKit**: No CDP remote debugging (browser limitation)
-2. **DevToolsActivePort**: 500ms delay after launch to read file
+2. **Multiple concurrent browsers**: Use `MINIAGENT_FORCE_DEBUG_PORT=0` or different ports per instance
 3. **Silent errors**: Errors that don't raise exceptions aren't detected
 4. **Async API**: Less tested than sync API (but works)
 

@@ -26,6 +26,10 @@ _MODE = os.environ.get("MINIAGENT_ON_ERROR", "report").lower()  # report|hold|sw
 _HOLD_RAW = os.environ.get("MINIAGENT_HOLD_SECS", "").strip().lower()
 _RESUME_FILE = os.environ.get("MINIAGENT_RESUME_FILE", "/tmp/miniagent_resume")
 
+# Remote debugging port configuration
+_DEBUG_PORT = int(os.environ.get("MINIAGENT_DEBUG_PORT", "9222"))
+_FORCE_DEBUG_PORT = os.environ.get("MINIAGENT_FORCE_DEBUG_PORT", "1") == "1"
+
 
 def _hold_deadline():
     """Compute hold deadline from MINIAGENT_HOLD_SECS env var."""
@@ -123,14 +127,19 @@ def _intercept_playwright():
         
         args = list(args) if args else []
         
-        # Check if debug port already set
+        # Remove existing debug port args if forcing
+        if _FORCE_DEBUG_PORT:
+            args = [arg for arg in args if "--remote-debugging-port" not in str(arg)]
+            args = [arg for arg in args if "--remote-debugging-address" not in str(arg)]
+        
+        # Check if debug port already set (after potential removal)
         has_debug = any("--remote-debugging-port" in str(arg) for arg in args)
         if not has_debug:
             args.extend([
                 "--remote-debugging-address=127.0.0.1",
-                "--remote-debugging-port=0"  # Let Chrome pick a free port
+                f"--remote-debugging-port={_DEBUG_PORT}"
             ])
-            logger.debug("Injected remote debugging flags")
+            logger.debug(f"Injected remote debugging flags (port {_DEBUG_PORT})")
         
         return args
     
@@ -166,21 +175,15 @@ def _intercept_playwright():
         
         browser = _orig_sync_launch(self, *args, **kwargs)
         
-        # Try to read debug port
+        # Set debug port for Chromium (we know it because we set it)
         debug_port = None
         if browser_name in ("chromium", "chrome", "msedge"):
-            # Access internal context if available
-            try:
-                if hasattr(browser, "_impl") and hasattr(browser._impl, "_browser_type"):
-                    # Try to get user data dir from persistent context
-                    pass
-                # For now, store browser type
-                _browser_info[id(browser)] = {
-                    "browser": browser_name,
-                    "debug_port": debug_port
-                }
-            except:
-                pass
+            debug_port = _DEBUG_PORT
+            _browser_info[id(browser)] = {
+                "browser": browser_name,
+                "debug_port": debug_port
+            }
+            logger.info(f"Chromium launched with debug port {debug_port}")
         else:
             _browser_info[id(browser)] = {
                 "browser": "firefox" if browser_name == "firefox" else "webkit",
@@ -205,12 +208,19 @@ def _intercept_playwright():
         
         context = _orig_sync_launch_persistent(self, user_data_dir, *args, **kwargs)
         
-        # Read debug port for Chromium
+        # Set debug port for Chromium (we know it because we set it)
         debug_port = None
         if browser_name in ("chromium", "chrome", "msedge"):
+            debug_port = _DEBUG_PORT
+            
+            # Sanity check: read DevToolsActivePort file if available
             import time
             time.sleep(0.5)  # Give Chrome time to write the file
-            debug_port = _read_devtools_port(Path(user_data_dir))
+            detected_port = _read_devtools_port(Path(user_data_dir))
+            if detected_port and detected_port != debug_port:
+                logger.warning(f"DevToolsActivePort mismatch: configured={debug_port}, detected={detected_port}")
+            
+            logger.info(f"Chromium persistent context launched with debug port {debug_port}")
         
         _browser_info[id(context)] = {
             "browser": browser_name if browser_name in ("chromium", "firefox", "webkit") else "chromium",
