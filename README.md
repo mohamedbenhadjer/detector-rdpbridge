@@ -18,7 +18,37 @@ Automatically detect Playwright errors and send support requests to your Flutter
 2. The hook monkey-patches Playwright APIs to intercept exceptions
 3. On error, sends a WebSocket message to your Flutter app at `ws://127.0.0.1:8777/ws`
 4. Flutter creates a support request with control info for remote assistance
-5. Your test continues or handles the exception normally
+5. Your test continues or handles the exception based on the configured mode
+
+## Error Handling Modes
+
+Choose how errors are handled:
+
+### Report Mode (Default)
+- Sends support request
+- Re-raises the exception
+- Script exits or handles error in try/except
+- **Use when:** You want error reporting without changing script behavior
+
+### Hold Mode (Recommended for Agent Intervention)
+- Sends support request
+- Pauses the script execution
+- Keeps browser open
+- Waits for agent to fix the issue
+- Resumes when: `touch $MINIAGENT_RESUME_FILE` or timeout reached
+- **Use when:** You need live agent assistance to fix errors
+
+```bash
+export MINIAGENT_ON_ERROR=hold
+export MINIAGENT_RESUME_FILE=/tmp/miniagent_resume
+export MINIAGENT_HOLD_SECS=3600  # Optional: timeout after 1 hour
+```
+
+### Swallow Mode
+- Sends support request
+- Returns `None` for failed action
+- Script continues immediately
+- **Use when:** You want to log errors but continue execution regardless
 
 ## Setup
 
@@ -113,6 +143,9 @@ The hook will automatically:
 | `MINIAGENT_CLIENT` | No | `python-cdp-monitor` | Client name sent in handshake |
 | `MINIAGENT_COOLDOWN_SEC` | No | `20` | Seconds between duplicate requests |
 | `MINIAGENT_REDACT_URLS` | No | `0` | Set to `1` to exclude URLs/titles |
+| `MINIAGENT_ON_ERROR` | No | `report` | Error handling: `report` (re-raise), `hold` (pause and wait), `swallow` (continue) |
+| `MINIAGENT_RESUME_FILE` | No | `/tmp/miniagent_resume` | File path to signal resume in hold mode |
+| `MINIAGENT_HOLD_SECS` | No | `""` (forever) | Timeout in seconds for hold mode, or "forever"/"inf" |
 
 ## Support Request Payload
 
