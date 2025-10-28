@@ -268,27 +268,63 @@ If missing, check error messages.
 
 **Symptoms**: `controlTarget.debugPort` is null/missing for Chromium
 
+**Note**: Since v2.0, the hook forces port 9222 by default, so this should rarely occur.
+
 **Diagnosis**:
 ```bash
-# Check if DevToolsActivePort file exists
-# (requires knowing user-data-dir, typically in /tmp or C:\Users\...\AppData\Local\Temp)
-find /tmp -name "DevToolsActivePort" 2>/dev/null
+# Verify Chromium is listening on port 9222
+curl http://127.0.0.1:9222/json/version
+
+# Check if port is in use
+lsof -i :9222  # Linux/Mac
+netstat -an | findstr 9222  # Windows
 ```
 
 **Causes & Solutions**:
 
-1. **Launch timing**
-   - Hook waits 500ms after launch for Chrome to write the file
-   - If still missing, increase delay in sitecustomize.py (line ~150)
+1. **Port already in use**
+   - Another Chromium instance or process is using port 9222
+   - Solution: Kill the process or use a different port via `MINIAGENT_DEBUG_PORT`
 
-2. **Headless mode**
-   - Remote debugging works in headless too
-   - Ensure `--remote-debugging-port=0` is injected (check browser command line)
+2. **Force disabled**
+   - If you set `MINIAGENT_FORCE_DEBUG_PORT=0`, the hook won't override user args
+   - Solution: Ensure you're providing `--remote-debugging-port` in your script
 
-3. **User data dir not accessible**
-   - Permissions issue
-   - Temporary directory cleanup
-   - Solution: Use `launch_persistent_context` with explicit user_data_dir
+3. **Firewall blocking**
+   - Localhost firewall rules blocking 127.0.0.1:9222
+   - Solution: Allow localhost connections or disable firewall for testing
+
+---
+
+### "Port 9222 already in use"
+
+**Symptoms**: Chromium fails to launch or launches without debug port
+
+**Diagnosis**:
+```bash
+# Find what's using port 9222
+lsof -i :9222  # Linux/Mac
+netstat -ano | findstr 9222  # Windows
+```
+
+**Solutions**:
+
+1. **Kill existing Chromium instance**
+   ```bash
+   pkill -f chromium  # Linux/Mac
+   taskkill /F /IM chrome.exe  # Windows
+   ```
+
+2. **Use a different port**
+   ```bash
+   export MINIAGENT_DEBUG_PORT=9223
+   ```
+
+3. **Run multiple browsers** (disable force mode)
+   ```bash
+   export MINIAGENT_FORCE_DEBUG_PORT=0
+   # Then provide unique ports in your script args
+   ```
 
 ---
 
@@ -299,6 +335,27 @@ find /tmp -name "DevToolsActivePort" 2>/dev/null
 **If showing a port**: Bug in browser detection logic
 
 **Workaround**: Check `controlTarget.browser` field to determine if CDP is available
+
+---
+
+### Verify CDP Connection
+
+**Quick test** to confirm Chrome DevTools Protocol is accessible:
+
+```bash
+# While Chromium is running via Playwright:
+curl http://127.0.0.1:9222/json/version
+
+# Or list all pages/tabs:
+curl http://127.0.0.1:9222/json/list
+
+# Or open DevTools in your browser:
+# Navigate to: chrome://inspect or http://127.0.0.1:9222
+```
+
+**Expected**: JSON response with browser version and WebSocket URLs
+
+**If fails**: Check firewall, verify port in use, review logs
 
 ---
 

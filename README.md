@@ -143,6 +143,8 @@ The hook will automatically:
 | `MINIAGENT_CLIENT` | No | `python-cdp-monitor` | Client name sent in handshake |
 | `MINIAGENT_COOLDOWN_SEC` | No | `20` | Seconds between duplicate requests |
 | `MINIAGENT_REDACT_URLS` | No | `0` | Set to `1` to exclude URLs/titles |
+| `MINIAGENT_DEBUG_PORT` | No | `9222` | Remote debugging port for Chromium CDP |
+| `MINIAGENT_FORCE_DEBUG_PORT` | No | `1` | Set to `0` to respect user-provided debug port args |
 | `MINIAGENT_ON_ERROR` | No | `report` | Error handling: `report` (re-raise), `hold` (pause and wait), `swallow` (continue) |
 | `MINIAGENT_RESUME_FILE` | No | `/tmp/miniagent_resume` | File path to signal resume in hold mode |
 | `MINIAGENT_HOLD_SECS` | No | `""` (forever) | Timeout in seconds for hold mode, or "forever"/"inf" |
@@ -215,9 +217,31 @@ python -c "import sitecustomize"
 2. Verify Flutter has a signed-in user (returns `NO_USER` error otherwise)
 3. Check for `BAD_AUTH` errors (token mismatch)
 
-### Remote debugging port not available
+### Remote debugging port configuration
 
-For Chromium, the hook injects `--remote-debugging-port=0`. If you're already setting a custom port, it will be preserved. The `DevToolsActivePort` file is read ~500ms after launch.
+For Chromium, the hook automatically injects `--remote-debugging-port=9222` by default. This enables Chrome DevTools Protocol (CDP) access for remote control.
+
+**Configuration:**
+- `MINIAGENT_DEBUG_PORT=9222` (default) - Set the CDP port
+- `MINIAGENT_FORCE_DEBUG_PORT=1` (default) - Override any user-provided debug port args
+
+**Verify CDP is active:**
+```bash
+# Check if Chromium is listening on port 9222
+curl http://127.0.0.1:9222/json/version
+
+# Expected output:
+{
+   "Browser": "Chrome/...",
+   "Protocol-Version": "1.3",
+   "User-Agent": "Mozilla/5.0 ...",
+   "WebKit-Version": "...",
+   "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/browser/..."
+}
+```
+
+**Multiple concurrent browsers:**
+If running multiple Chromium instances simultaneously, set `MINIAGENT_FORCE_DEBUG_PORT=0` and provide unique ports manually in your script, or use different ports via `MINIAGENT_DEBUG_PORT`.
 
 ## Testing the Setup
 
