@@ -1,329 +1,239 @@
-# Playwright Watchdog with CDP Support
+# Playwright Auto-Hook Support Request Agent
 
-A cross-platform service that monitors Playwright test runs, logs lifecycle events, keeps browsers open on failures, and provides Chrome DevTools Protocol (CDP) access for debugging and automation — all without modifying test code.
+Automatically detect Playwright errors and send support requests to your Flutter app **without modifying your Playwright scripts**.
 
 ## Features
 
-- 🔍 **Automatic Detection**: Identifies Playwright processes (Node.js and Python)
-- 📊 **Lifecycle Logging**: Logs test start/exit events as structured JSONL
-- 🐛 **CDP Access**: Enables remote debugging and captures WebSocket URLs
-- 🌐 **Keep Browser Open**: Preserves browser state on failures for debugging
-- 🚫 **No Test Modifications**: Works via environment variables and runtime injection
-- 🖥️ **Cross-Platform**: Full support for Linux and Windows
+- ✅ **Zero code changes** to your Playwright tests
+- ✅ Catches timeouts, selector errors, actionability failures, navigation errors, assertions
+- ✅ Keeps browser and process running after errors
+- ✅ Auto-enables remote debugging for Chromium (allows agent control via CDP)
+- ✅ Cross-browser: Chromium, Firefox, WebKit
+- ✅ Cross-platform: Linux and Windows
+- ✅ Deduplication and cooldown to avoid spam
 
-## Quick Start
+## How It Works
+
+1. Python auto-loads `sitecustomize.py` from `PYTHONPATH`
+2. The hook monkey-patches Playwright APIs to intercept exceptions
+3. On error, sends a WebSocket message to your Flutter app at `ws://127.0.0.1:8777/ws`
+4. Flutter creates a support request with control info for remote assistance
+5. Your test continues or handles the exception normally
+
+## Setup
 
 ### 1. Install Dependencies
 
 ```bash
 pip install -r requirements.txt
+playwright install
 ```
 
-### 2. Start the Watchdog
+### 2. Set Environment Variables
 
-#### Run Manually (foreground)
+#### Linux (bash/zsh)
+
+Add to `~/.bashrc` or `~/.zshrc`:
 
 ```bash
-./playwright_watchdog.py
+# MiniAgent configuration
+export PYTHONPATH="/home/mohamed/detector-rdpbridge:$PYTHONPATH"
+export MINIAGENT_ENABLED=1
+export MINIAGENT_WS_URL="ws://127.0.0.1:8777/ws"
+export MINIAGENT_TOKEN="your-shared-token-here"
+export MINIAGENT_CLIENT="python-cdp-monitor"
+export MINIAGENT_COOLDOWN_SEC=20
+# Optional: redact URLs/titles in support requests
+# export MINIAGENT_REDACT_URLS=1
 ```
 
-#### Or Install as Service
-
-**Linux (systemd):**
-
+Then reload:
 ```bash
-# Edit paths in the service file
-vi systemd/user/pw-watchdog.service
-
-# Install
-mkdir -p ~/.config/systemd/user
-cp systemd/user/pw-watchdog.service ~/.config/systemd/user/
-systemctl --user enable --now pw-watchdog
-
-# Check status
-systemctl --user status pw-watchdog
+source ~/.bashrc
 ```
 
-**Windows (Scheduled Task):**
+#### Windows (PowerShell)
+
+Add to your PowerShell profile (`$PROFILE`):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\windows\install_watchdog_task.ps1
+# MiniAgent configuration
+$env:PYTHONPATH = "C:\Users\YourUser\detector-rdpbridge;$env:PYTHONPATH"
+$env:MINIAGENT_ENABLED = "1"
+$env:MINIAGENT_WS_URL = "ws://127.0.0.1:8777/ws"
+$env:MINIAGENT_TOKEN = "your-shared-token-here"
+$env:MINIAGENT_CLIENT = "python-cdp-monitor"
+$env:MINIAGENT_COOLDOWN_SEC = "20"
 ```
 
-### 3. Run Your Tests
+Or set system/user environment variables via System Properties → Advanced → Environment Variables.
 
-#### Node.js (Playwright Test)
+#### Windows (CMD)
+
+Create a batch file to set variables before running tests:
+
+```batch
+@echo off
+set PYTHONPATH=C:\Users\YourUser\detector-rdpbridge;%PYTHONPATH%
+set MINIAGENT_ENABLED=1
+set MINIAGENT_WS_URL=ws://127.0.0.1:8777/ws
+set MINIAGENT_TOKEN=your-shared-token-here
+set MINIAGENT_CLIENT=python-cdp-monitor
+set MINIAGENT_COOLDOWN_SEC=20
+
+REM Run your test
+python my_playwright.py
+```
+
+### 3. Get Your Shared Token
+
+The `MINIAGENT_TOKEN` must match the token configured in your Flutter app's local WebSocket server.
+
+You can find or generate it in your Flutter app configuration.
+
+### 4. Run Your Tests (No Changes!)
 
 ```bash
-./bin/pw-run.sh
-
-# Or manually:
-RUNID=$(date +%s%3N)-$$
-PWDEBUG=1 \
-PW_WATCHDOG_RUN_ID="$RUNID" \
-NODE_OPTIONS="--require $(pwd)/injectors/pw_injector.js" \
-npx playwright test --reporter=json,line --trace=retain-on-failure
+python my_playwright.py
 ```
 
-#### Python (pytest)
+The hook will automatically:
+- Intercept errors
+- Enable remote debugging for Chromium
+- Send support requests to Flutter
 
-```bash
-./bin/pw-run-pytest.sh
+## Configuration Reference
 
-# Or manually:
-RUNID=$(date +%s%3N)-$$
-PWDEBUG=1 \
-PW_WATCHDOG_RUN_ID="$RUNID" \
-PYTHONPATH="$(pwd)/injectors/pw_py_inject" \
-PYTEST_ADDOPTS="--junitxml=$HOME/.pw_watchdog/reports/$RUNID.xml" \
-pytest
-```
+| Environment Variable | Required | Default | Description |
+|---------------------|----------|---------|-------------|
+| `PYTHONPATH` | ✅ Yes | - | Must include this directory |
+| `MINIAGENT_ENABLED` | No | `1` | Set to `0` to disable the hook |
+| `MINIAGENT_WS_URL` | No | `ws://127.0.0.1:8777/ws` | Flutter WebSocket server URL |
+| `MINIAGENT_TOKEN` | ✅ Yes | - | Shared authentication token |
+| `MINIAGENT_CLIENT` | No | `python-cdp-monitor` | Client name sent in handshake |
+| `MINIAGENT_COOLDOWN_SEC` | No | `20` | Seconds between duplicate requests |
+| `MINIAGENT_REDACT_URLS` | No | `0` | Set to `1` to exclude URLs/titles |
 
-## How It Works
+## Support Request Payload
 
-### Architecture
+When an error occurs, the agent sends:
 
-1. **Watchdog Core** (`playwright_watchdog.py`)
-   - Monitors system processes for Playwright test runs
-   - Uses WMI on Windows, psutil polling on Linux (with optional netlink support)
-   - Logs structured events as JSONL
-
-2. **Runtime Injectors** (no test code changes)
-   - **Node.js** (`injectors/pw_injector.js`): Patches `chromium.launch()` via `NODE_OPTIONS`
-   - **Python** (`injectors/pw_py_inject/sitecustomize.py`): Monkey-patches `BrowserType.launch()` via `PYTHONPATH`
-   - Both force `--remote-debugging-port=0` and `headless: false` for Chromium
-
-3. **Artifact Correlation**
-   - Parses Playwright JSON reports (Node.js) or JUnit XML (Python)
-   - Extracts failure details, trace files, screenshots
-   - Correlates with process lifecycle events
-
-4. **CDP Metadata**
-   - Injectors discover the CDP WebSocket URL from `DevToolsActivePort`
-   - Written to `~/.pw_watchdog/cdp/<runId>.json`
-   - Available for programmatic browser control
-
-## Output
-
-### Event Log (`~/.pw_watchdog/logs/watchdog.jsonl`)
-
-**playwright_started:**
 ```json
 {
-  "event": "playwright_started",
-  "ts": "2025-10-26T12:34:56.789Z",
-  "runId": "12345-1729945696789",
-  "os": "Linux",
-  "pid": 12345,
-  "cmdline": ["npx", "playwright", "test"],
-  "engine": "chromium",
-  "cdp": {
-    "port": 9222,
-    "wsUrl": "ws://127.0.0.1:9222/devtools/browser/..."
+  "type": "support_request",
+  "payload": {
+    "description": "TimeoutError: click: locator('button:has-text(\"Login\")')",
+    "controlTarget": {
+      "browser": "chromium",
+      "debugPort": 9222,
+      "urlContains": "https://example.com/login",
+      "titleContains": "Login Page"
+    },
+    "meta": {
+      "runId": "a1b2c3d4",
+      "pid": 12345,
+      "reason": "TimeoutError",
+      "ts": "2025-10-27T12:34:56.000Z"
+    }
   }
 }
 ```
 
-**playwright_failed:**
-```json
-{
-  "event": "playwright_failed",
-  "ts": "2025-10-26T12:35:10.123Z",
-  "runId": "12345-1729945696789",
-  "pid": 12345,
-  "exitCode": 1,
-  "durationMs": 13334,
-  "error": {
-    "title": "Login > should authenticate user",
-    "message": "Expected: true, Received: false"
-  },
-  "artifacts": {
-    "traces": ["test-results/.../trace.zip"],
-    "screenshots": ["test-results/.../screenshot.png"]
-  }
-}
-```
+### Browser-Specific Behavior
 
-### CDP Metadata (`~/.pw_watchdog/cdp/<runId>.json`)
+- **Chromium/Chrome/Edge**: `debugPort` included, remote control available via CDP
+- **Firefox/WebKit**: `debugPort` omitted, limited remote control
 
-```json
-{
-  "runId": "12345-1729945696789",
-  "port": 9222,
-  "wsUrl": "ws://127.0.0.1:9222/devtools/browser/abc123...",
-  "devtoolsActivePortPath": "/tmp/playwright_chromium_12345/DevToolsActivePort"
-}
-```
+## Detected Errors
 
-## Configuration
+The hook catches:
 
-Create a `.env` file or set environment variables:
-
-```bash
-# Watchdog directory (default: ~/.pw_watchdog)
-PW_WATCHDOG_DIR=/custom/path
-
-# Poll interval in seconds (default: 0.5)
-PW_WATCHDOG_POLL_INTERVAL=0.5
-
-# Enable stdout logging (default: 1)
-PW_WATCHDOG_STDOUT=1
-
-# Log rotation (default: 10MB, 5 backups)
-PW_WATCHDOG_LOG_MAX_SIZE=10485760
-PW_WATCHDOG_LOG_BACKUPS=5
-```
-
-See `.env.example` for all options.
-
-## Project Structure
-
-```
-.
-├── playwright_watchdog.py          # Core watchdog service
-├── injectors/
-│   ├── pw_injector.js             # Node.js runtime injector
-│   └── pw_py_inject/
-│       └── sitecustomize.py       # Python runtime injector
-├── bin/
-│   ├── pw-run.sh                  # Node.js test wrapper (Linux/macOS)
-│   └── pw-run-pytest.sh           # Python test wrapper (Linux/macOS)
-├── windows/
-│   ├── install_watchdog_task.ps1  # Service installer
-│   ├── pw-run.ps1                 # Node.js test wrapper
-│   └── pw-run-pytest.ps1          # Python test wrapper
-├── systemd/
-│   └── user/
-│       └── pw-watchdog.service    # systemd unit file
-├── requirements.txt               # Python dependencies
-├── WATCHDOG_USAGE.md             # Detailed usage guide
-└── README.md                      # This file
-```
-
-## Use Cases
-
-### 1. Debugging Flaky Tests
-
-When a test fails, the browser stays open with `PWDEBUG=1`, and you have:
-- Visual inspection of the final state
-- CDP WebSocket URL for programmatic control
-- Trace files and screenshots in the logs
-
-### 2. CI/CD Integration
-
-Parse the JSONL logs for:
-- Test duration metrics
-- Failure summaries with stack traces
-- Artifact locations for archival
-
-### 3. Remote Browser Automation
-
-Use the CDP WebSocket URL to:
-- Take additional screenshots
-- Execute custom DevTools commands
-- Inject debugging scripts
-- Control the browser programmatically
-
-### 4. Monitoring Production Smoke Tests
-
-Run the watchdog on a schedule to:
-- Track test health over time
-- Correlate failures with deployments
-- Alert on persistent issues
-
-## Advanced Usage
-
-### Connect to CDP Programmatically
-
-**Node.js:**
-```javascript
-const CDP = require('chrome-remote-interface');
-
-const wsUrl = 'ws://127.0.0.1:9222/devtools/browser/...';
-const client = await CDP({ target: wsUrl });
-
-const { Page } = client;
-await Page.enable();
-await Page.captureScreenshot({ path: 'debug.png' });
-```
-
-**Python:**
-```python
-from playwright.async_api import async_playwright
-
-async with async_playwright() as p:
-    browser = await p.chromium.connect_over_cdp('ws://...')
-    page = browser.contexts[0].pages[0]
-    await page.screenshot(path='debug.png')
-```
-
-### Query JSONL Logs
-
-```bash
-# Find all failures
-jq 'select(.event == "playwright_failed")' ~/.pw_watchdog/logs/watchdog.jsonl
-
-# Extract CDP URLs
-jq -r 'select(.event == "playwright_started") | .cdp.wsUrl' \
-  ~/.pw_watchdog/logs/watchdog.jsonl
-
-# Summary stats
-jq -s 'group_by(.event) | map({event: .[0].event, count: length})' \
-  ~/.pw_watchdog/logs/watchdog.jsonl
-```
+- ✅ `TimeoutError` - element not found, wait timeout
+- ✅ `Error` - Playwright API errors, actionability failures
+- ✅ `AssertionError` - failed expect() assertions
+- ✅ Navigation timeouts and failures
+- ✅ Selector errors (element not visible, not enabled, etc.)
 
 ## Troubleshooting
 
-### Watchdog not detecting tests
+### Hook not activating
 
-1. Ensure the watchdog is running: `ps aux | grep playwright_watchdog`
-2. Check command patterns match: Review `NODE_PATTERNS` and `PYTHON_PATTERNS` in the code
-3. Tail logs: `tail -f ~/.pw_watchdog/logs/watchdog.jsonl`
+Check that:
+1. `PYTHONPATH` includes this directory
+2. `MINIAGENT_TOKEN` is set
+3. Playwright is installed: `pip show playwright`
 
-### CDP info not available
+Enable debug logging:
+```bash
+export MINIAGENT_ENABLED=1
+python -c "import sitecustomize"
+```
 
-1. Verify injector is loaded: `echo $NODE_OPTIONS` or `echo $PYTHONPATH`
-2. Look for injector stderr messages: `[pw_injector]` or `[pw_py_inject]`
-3. Confirm Chromium is being used (injectors only patch Chromium)
+### WebSocket connection fails
 
-### Performance impact
+1. Ensure Flutter app is running
+2. Check that Flutter's local WS server is on port 8777
+3. Verify token matches Flutter configuration
+4. Check logs for connection errors
 
-- Polling mode: ~0.5s interval, minimal CPU (~0.1%)
-- WMI (Windows): Event-driven, near-zero overhead
-- Netlink (Linux): Event-driven but requires root
+### No support requests sent
 
-## Documentation
+1. Check cooldown period (default 20s between duplicate requests)
+2. Verify Flutter has a signed-in user (returns `NO_USER` error otherwise)
+3. Check for `BAD_AUTH` errors (token mismatch)
 
-See [WATCHDOG_USAGE.md](WATCHDOG_USAGE.md) for comprehensive documentation including:
-- Detailed installation steps
-- Platform-specific configuration
-- Complete API reference
-- Security considerations
-- Troubleshooting guide
+### Remote debugging port not available
 
-## Requirements
+For Chromium, the hook injects `--remote-debugging-port=0`. If you're already setting a custom port, it will be preserved. The `DevToolsActivePort` file is read ~500ms after launch.
 
-- Python 3.7+
-- `psutil` for process monitoring
-- `python-dotenv` for configuration
-- `pywin32` (Windows only, for WMI)
-- Playwright (Node.js or Python) for your tests
+## Testing the Setup
 
-## Contributing
+Create a test file `test_hook.py`:
 
-Contributions welcome! Areas for improvement:
-- Full netlink implementation for Linux
-- Firefox and WebKit support
-- Web dashboard for log visualization
-- Webhook notifications
-- Integration tests
+```python
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=False)
+    page = browser.new_page()
+    page.goto("https://example.com")
+    
+    # This will trigger a support request (button doesn't exist)
+    try:
+        page.click("button:has-text('NonExistentButton')", timeout=5000)
+    except Exception as e:
+        print(f"Caught error: {e}")
+    
+    print("Test continues after error!")
+    input("Press Enter to close browser...")
+    browser.close()
+```
+
+Run:
+```bash
+python test_hook.py
+```
+
+Expected behavior:
+1. Browser opens
+2. After ~5s timeout, error is caught
+3. Support request sent to Flutter
+4. Script continues and waits for Enter
+
+Check Flutter logs for the incoming support request.
+
+## Uninstalling
+
+To disable the hook:
+
+```bash
+export MINIAGENT_ENABLED=0
+```
+
+Or remove the `PYTHONPATH` entry.
 
 ## License
 
-MIT License - see LICENSE file for details
-
----
-
-**Note**: This watchdog is designed for development and CI environments. CDP exposes full browser control, so use on trusted networks only.
+MIT
 
 
