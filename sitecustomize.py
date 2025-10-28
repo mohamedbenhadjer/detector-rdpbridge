@@ -6,6 +6,8 @@ Intercepts Playwright exceptions and sends support requests without modifying us
 import os
 import sys
 import logging
+import time
+import asyncio
 from pathlib import Path
 from typing import Optional, Any, Dict
 
@@ -18,6 +20,48 @@ logger.setLevel(logging.INFO)
 
 # Track if we've already patched
 _patched = False
+
+# Error handling mode configuration
+_MODE = os.environ.get("MINIAGENT_ON_ERROR", "report").lower()  # report|hold|swallow
+_HOLD_RAW = os.environ.get("MINIAGENT_HOLD_SECS", "").strip().lower()
+_RESUME_FILE = os.environ.get("MINIAGENT_RESUME_FILE", "/tmp/miniagent_resume")
+
+
+def _hold_deadline():
+    """Compute hold deadline from MINIAGENT_HOLD_SECS env var."""
+    if _HOLD_RAW in ("", "forever", "inf"):
+        return None
+    try:
+        return time.time() + float(_HOLD_RAW)
+    except Exception:
+        return None
+
+
+def _park_until_resume(reason: str, details: str):
+    """
+    Block the process until resume signal or timeout.
+    Resume happens when MINIAGENT_RESUME_FILE is created or deadline is reached.
+    """
+    logger.warning(f"Holding on error ({reason}) - waiting for agent. Resume file: {_RESUME_FILE}")
+    deadline = _hold_deadline()
+    
+    while True:
+        try:
+            if _RESUME_FILE and Path(_RESUME_FILE).exists():
+                logger.info("Resume signal detected; continuing.")
+                try:
+                    Path(_RESUME_FILE).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return
+        except Exception:
+            pass
+        
+        if deadline and time.time() >= deadline:
+            logger.info("Hold timeout reached; continuing.")
+            return
+        
+        time.sleep(1.0)
 
 
 def _get_page_info(page_obj) -> Dict[str, Any]:
@@ -220,7 +264,13 @@ def _intercept_playwright():
                     page_id=page_info.get("page_id")
                 )
                 
-                # Re-raise the exception
+                # Handle based on mode
+                if _MODE == "hold":
+                    _park_until_resume(error_type, error_msg)
+                    return None
+                if _MODE == "swallow":
+                    return None
+                # Default: re-raise the exception
                 raise
         
         async def _async_wrapper(self, *args, **kwargs):
@@ -251,6 +301,30 @@ def _intercept_playwright():
                     page_id=page_info.get("page_id")
                 )
                 
+                # Handle based on mode
+                if _MODE == "hold":
+                    # Async park until resume/timeout
+                    logger.warning(f"Holding on error ({error_type}) - waiting for agent. Resume file: {_RESUME_FILE}")
+                    deadline = _hold_deadline()
+                    while True:
+                        try:
+                            if _RESUME_FILE and Path(_RESUME_FILE).exists():
+                                logger.info("Resume signal detected; continuing.")
+                                try:
+                                    Path(_RESUME_FILE).unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                                return None
+                        except Exception:
+                            pass
+                        if deadline and time.time() >= deadline:
+                            logger.info("Hold timeout reached; continuing.")
+                            return None
+                        await asyncio.sleep(1.0)
+                
+                if _MODE == "swallow":
+                    return None
+                # Default: re-raise the exception
                 raise
         
         wrapper = _async_wrapper if is_async else _sync_wrapper
