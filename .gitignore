@@ -93,7 +93,11 @@ docs/_build/
 # PyBuilder
 .pybuilder/
 target/
+
+# Project-specific ignores
 pi.py
+*.png
+
 # Jupyter Notebook
 .ipynb_checkpoints
 
