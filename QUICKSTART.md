@@ -65,7 +65,27 @@ When an error occurs in hold mode:
 2. Support request is sent to Flutter
 3. Script pauses and waits
 4. Agent fixes the issue
-5. Resume the script: `touch /tmp/miniagent_resume`
+5. Resume the script: `touch /tmp/miniagent_resume` (or use the optional HTTP endpoint below)
+
+#### Optional: Resume via HTTP endpoint
+
+Enable a local HTTP endpoint the agent can call to resume automatically:
+
+```bash
+export MINIAGENT_RESUME_HTTP=1
+export MINIAGENT_RESUME_HTTP_HOST=127.0.0.1
+export MINIAGENT_RESUME_HTTP_PORT=8787
+export MINIAGENT_RESUME_HTTP_TOKEN="strong-shared-secret"
+export MINIAGENT_RESUME_FILE=/tmp/miniagent_resume
+```
+
+Agent call example:
+
+```bash
+curl -sS -X POST \
+  http://127.0.0.1:8787/resume \
+  -H "Authorization: Bearer $MINIAGENT_RESUME_HTTP_TOKEN"
+```
 
 ### Swallow Mode
 Ignores errors and continues (returns None for failed actions):

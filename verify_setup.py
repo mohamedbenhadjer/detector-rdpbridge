@@ -113,6 +113,25 @@ def main():
         print("   ⊘ Skipped (token not set)")
     print()
     
+    # Optional: HTTP resume endpoint configuration
+    print("7. Checking HTTP resume endpoint (optional)...")
+    resume_http = os.environ.get("MINIAGENT_RESUME_HTTP", "0")
+    if resume_http == "1":
+        host = os.environ.get("MINIAGENT_RESUME_HTTP_HOST", "127.0.0.1")
+        port = os.environ.get("MINIAGENT_RESUME_HTTP_PORT", "8787")
+        http_token = os.environ.get("MINIAGENT_RESUME_HTTP_TOKEN", "")
+        _ = check_mark(True, f"MINIAGENT_RESUME_HTTP=1 (enabled)")
+        _ = check_mark(bool(host), f"MINIAGENT_RESUME_HTTP_HOST={host}")
+        _ = check_mark(bool(port), f"MINIAGENT_RESUME_HTTP_PORT={port}")
+        if http_token:
+            _ = check_mark(True, "MINIAGENT_RESUME_HTTP_TOKEN=***set***")
+        else:
+            _ = check_mark(False, "MINIAGENT_RESUME_HTTP_TOKEN not set (required when enabled)")
+        print("   Resume file:", os.environ.get("MINIAGENT_RESUME_FILE", "/tmp/miniagent_resume"))
+    else:
+        _ = check_mark(True, "MINIAGENT_RESUME_HTTP=0 (disabled)")
+    print()
+    
     # Summary
     print("=" * 60)
     if all_ok:

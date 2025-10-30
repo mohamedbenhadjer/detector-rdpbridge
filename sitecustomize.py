@@ -8,8 +8,11 @@ import sys
 import logging
 import time
 import asyncio
+import threading
+import json
 from pathlib import Path
 from typing import Optional, Any, Dict
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Only activate if explicitly enabled
 if os.environ.get("MINIAGENT_ENABLED", "1") != "1":
@@ -17,6 +20,10 @@ if os.environ.get("MINIAGENT_ENABLED", "1") != "1":
 
 logger = logging.getLogger("miniagent.hook")
 logger.setLevel(logging.INFO)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    logger.addHandler(handler)
 
 # Track if we've already patched
 _patched = False
@@ -25,6 +32,12 @@ _patched = False
 _MODE = os.environ.get("MINIAGENT_ON_ERROR", "report").lower()  # report|hold|swallow
 _HOLD_RAW = os.environ.get("MINIAGENT_HOLD_SECS", "").strip().lower()
 _RESUME_FILE = os.environ.get("MINIAGENT_RESUME_FILE", "/tmp/miniagent_resume")
+
+# Optional HTTP resume endpoint configuration
+_RESUME_HTTP_ENABLED = os.environ.get("MINIAGENT_RESUME_HTTP", "0") == "1"
+_RESUME_HTTP_HOST = os.environ.get("MINIAGENT_RESUME_HTTP_HOST", "127.0.0.1")
+_RESUME_HTTP_PORT = int(os.environ.get("MINIAGENT_RESUME_HTTP_PORT", "8787"))
+_RESUME_HTTP_TOKEN = os.environ.get("MINIAGENT_RESUME_HTTP_TOKEN", "").strip()
 
 # Remote debugging port configuration
 _DEBUG_PORT = int(os.environ.get("MINIAGENT_DEBUG_PORT", "9222"))
@@ -66,6 +79,82 @@ def _park_until_resume(reason: str, details: str):
             return
         
         time.sleep(1.0)
+
+
+class _ResumeRequestHandler(BaseHTTPRequestHandler):
+    """Minimal HTTP handler for POST /resume with bearer auth.
+    Creates the resume file watched by the hold loop.
+    """
+
+    server_version = "MiniAgentResumeHTTP/1.0"
+    sys_version = ""
+
+    def log_message(self, format, *args):
+        try:
+            logger.info("resume-http: " + (format % args))
+        except Exception:
+            pass
+
+    def _send_json(self, status: int, payload: Dict[str, Any]):
+        try:
+            body = json.dumps(payload).encode("utf-8")
+        except Exception:
+            body = b"{}"
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def do_POST(self):  # noqa: N802 (method name by BaseHTTPRequestHandler)
+        if self.path != "/resume":
+            self._send_json(404, {"ok": False, "error": "not_found"})
+            return
+
+        token = _RESUME_HTTP_TOKEN
+        auth_header = self.headers.get("Authorization", "")
+
+        if not token or not auth_header.startswith("Bearer "):
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return
+
+        expected = f"Bearer {token}"
+        if auth_header.strip() != expected:
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return
+
+        try:
+            Path(_RESUME_FILE).touch(exist_ok=True)
+            logger.info("Resume HTTP: resume signal emitted via file")
+            self._send_json(200, {"ok": True})
+        except Exception as e:
+            logger.error(f"Resume HTTP: failed to emit resume signal: {e}")
+            self._send_json(500, {"ok": False, "error": "server_error"})
+
+
+def _start_resume_http_server():
+    """Start a daemonized HTTP server that exposes POST /resume.
+    Only starts when MINIAGENT_RESUME_HTTP=1 and a token is configured.
+    """
+    if not _RESUME_HTTP_ENABLED:
+        return
+
+    if not _RESUME_HTTP_TOKEN:
+        logger.error("Resume HTTP enabled but MINIAGENT_RESUME_HTTP_TOKEN is not set; not starting HTTP server")
+        return
+
+    try:
+        httpd = HTTPServer((_RESUME_HTTP_HOST, _RESUME_HTTP_PORT), _ResumeRequestHandler)
+    except Exception as e:
+        logger.warning(f"Resume HTTP: failed to bind {_RESUME_HTTP_HOST}:{_RESUME_HTTP_PORT}: {e}")
+        return
+
+    th = threading.Thread(target=httpd.serve_forever, name="miniagent-resume-http", daemon=True)
+    th.start()
+    logger.info(f"Resume HTTP server listening on http://{_RESUME_HTTP_HOST}:{_RESUME_HTTP_PORT}")
 
 
 def _get_page_info(page_obj) -> Dict[str, Any]:
@@ -392,5 +481,11 @@ try:
     _intercept_playwright()
 except Exception as e:
     logger.error(f"Failed to intercept Playwright: {e}", exc_info=True)
+
+# Start HTTP resume server (if enabled)
+try:
+    _start_resume_http_server()
+except Exception as e:
+    logger.error(f"Failed to start resume HTTP server: {e}")
 
 

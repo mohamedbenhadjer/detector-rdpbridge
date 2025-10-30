@@ -194,3 +194,39 @@ The current implementation uses a file signal. Future enhancements could include
 
 For now, the file signal is simple, reliable, and works across all platforms.
 
+## Test 6: HTTP Resume Endpoint (Optional)
+
+This test demonstrates resuming via a local HTTP endpoint instead of touching the resume file.
+
+### Setup
+```bash
+export MINIAGENT_ON_ERROR=hold
+export MINIAGENT_RESUME_FILE=/tmp/miniagent_resume
+export MINIAGENT_RESUME_HTTP=1
+export MINIAGENT_RESUME_HTTP_HOST=127.0.0.1
+export MINIAGENT_RESUME_HTTP_PORT=8787
+export MINIAGENT_RESUME_HTTP_TOKEN="strong-shared-secret"
+rm -f /tmp/miniagent_resume
+```
+
+### Run the test
+```bash
+python test_hold_mode.py
+```
+
+### Resume via HTTP
+While the script is paused:
+```bash
+curl -sS -X POST \
+  http://127.0.0.1:8787/resume \
+  -H "Authorization: Bearer $MINIAGENT_RESUME_HTTP_TOKEN"
+```
+
+**Expected behavior:**
+1. Script immediately continues
+2. Logs: "Resume signal detected; continuing."
+3. Navigates to playwright.dev and completes
+
+
+
+
