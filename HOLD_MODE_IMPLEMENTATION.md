@@ -130,7 +130,7 @@ python example_playwright_script.py
 ✅ **Three Modes**: report, hold, swallow for different use cases
 ✅ **Backward Compatible**: Default behavior unchanged (report mode)
 ✅ **Async Support**: Works with both sync and async Playwright code
-✅ **Flexible Resume**: File signal or timeout-based resumption
+✅ **Flexible Resume**: File signal, HTTP endpoint, or timeout-based resumption
 ✅ **Browser Persistence**: Browser stays open during hold
 ✅ **Support Requests**: Always sent regardless of mode
 
@@ -190,6 +190,26 @@ def _park_until_resume(reason: str, details: str):
             return
         
         time.sleep(1.0)
+```
+
+### HTTP Resume Endpoint (Optional)
+
+Enable a local HTTP endpoint so your agent can resume the script programmatically (instead of touching the file manually):
+
+```bash
+export MINIAGENT_RESUME_HTTP=1
+export MINIAGENT_RESUME_HTTP_HOST=127.0.0.1
+export MINIAGENT_RESUME_HTTP_PORT=8787
+export MINIAGENT_RESUME_HTTP_TOKEN="strong-shared-secret"
+export MINIAGENT_RESUME_FILE=/tmp/miniagent_resume
+```
+
+Call from the agent when work is complete:
+
+```bash
+curl -sS -X POST \
+  http://127.0.0.1:8787/resume \
+  -H "Authorization: Bearer $MINIAGENT_RESUME_HTTP_TOKEN"
 ```
 
 ## Integration with Agent Workflow
@@ -260,6 +280,12 @@ Potential improvements for future versions:
 - Check: File was created (`ls -la /tmp/miniagent_resume`)
 - Check: Script logs for "Resume signal detected" or "Hold timeout reached"
 
+#### HTTP resume issues
+- Check token set: `echo $MINIAGENT_RESUME_HTTP_TOKEN`
+- Check binding: `echo $MINIAGENT_RESUME_HTTP_HOST:$MINIAGENT_RESUME_HTTP_PORT`
+- If in containers/VMs, ensure networking path to the endpoint
+- Verify with: `curl -v -X POST http://127.0.0.1:8787/resume -H "Authorization: Bearer $MINIAGENT_RESUME_HTTP_TOKEN"`
+
 ### Resume file persists
 - Hook auto-deletes it, but you can: `rm -f /tmp/miniagent_resume`
 
@@ -278,4 +304,7 @@ The hold mode implementation successfully solves the problem of Playwright scrip
 4. All controlled via simple environment variables
 
 The implementation is backward compatible, well-documented, and ready for production use.
+
+
+
 

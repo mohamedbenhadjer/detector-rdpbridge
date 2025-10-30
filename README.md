@@ -36,6 +36,7 @@ Choose how errors are handled:
 - Keeps browser open
 - Waits for agent to fix the issue
 - Resumes when: `touch $MINIAGENT_RESUME_FILE` or timeout reached
+- Alternatively resume via HTTP endpoint (see below)
 - **Use when:** You need live agent assistance to fix errors
 
 ```bash
@@ -148,6 +149,43 @@ The hook will automatically:
 | `MINIAGENT_ON_ERROR` | No | `report` | Error handling: `report` (re-raise), `hold` (pause and wait), `swallow` (continue) |
 | `MINIAGENT_RESUME_FILE` | No | `/tmp/miniagent_resume` | File path to signal resume in hold mode |
 | `MINIAGENT_HOLD_SECS` | No | `""` (forever) | Timeout in seconds for hold mode, or "forever"/"inf" |
+| `MINIAGENT_RESUME_HTTP` | No | `0` | Set to `1` to enable local HTTP resume endpoint |
+| `MINIAGENT_RESUME_HTTP_HOST` | No | `127.0.0.1` | Host/interface to bind the HTTP endpoint |
+| `MINIAGENT_RESUME_HTTP_PORT` | No | `8787` | Port for the HTTP resume endpoint |
+| `MINIAGENT_RESUME_HTTP_TOKEN` | Recommended | - | Bearer token required to authorize resume requests |
+
+## HTTP Resume Endpoint (Optional)
+
+Instead of touching the resume file, you can trigger resume via a local HTTP endpoint. This is useful when your agent finishes a session and wants to resume the script programmatically.
+
+**Prerequisites:** Ensure `PYTHONPATH` includes this directory (required for sitecustomize to load).
+
+Enable and configure:
+
+```bash
+# Required: PYTHONPATH must be set
+export PYTHONPATH="/home/mohamed/detector-rdpbridge:$PYTHONPATH"
+
+# Enable HTTP resume
+export MINIAGENT_RESUME_HTTP=1
+export MINIAGENT_RESUME_HTTP_HOST=127.0.0.1
+export MINIAGENT_RESUME_HTTP_PORT=8787
+export MINIAGENT_RESUME_HTTP_TOKEN="strong-shared-secret"
+# The hold loop still watches this file; HTTP endpoint simply creates it
+export MINIAGENT_RESUME_FILE=/tmp/miniagent_resume
+```
+
+Agent call example:
+
+```bash
+curl -sS -X POST \
+  http://127.0.0.1:8787/resume \
+  -H "Authorization: Bearer $MINIAGENT_RESUME_HTTP_TOKEN"
+```
+
+Notes:
+- The server binds to localhost by default; if you expose it beyond localhost, protect it with firewall rules or tunneling.
+- The endpoint is idempotent and will log each request.
 
 ## Support Request Payload
 
