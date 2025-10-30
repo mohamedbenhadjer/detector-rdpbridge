@@ -9,19 +9,17 @@ export MINIAGENT_ENABLED=1
 export MINIAGENT_WS_URL="ws://127.0.0.1:8777/ws"
 export MINIAGENT_CLIENT="python-cdp-monitor"
 export MINIAGENT_COOLDOWN_SEC=0
-export MINIAGENT_DEBUG_PORT=9222
-export MINIAGENT_FORCE_DEBUG_PORT=1
-export PYTHONPATH="/home/mohamed/detector-rdpbridge:$PYTHONPATH"
-export MINIAGENT_ON_ERROR=hold
-export MINIAGENT_RESUME_HTTP=1
 export MINIAGENT_RESUME_HTTP_TOKEN="change-me"
 export MINIAGENT_TOKEN="change-me"
+export MINIAGENT_DEBUG_PORT=9222
+export MINIAGENT_FORCE_DEBUG_PORT=1
 export MINIAGENT_ON_ERROR=hold
+export MINIAGENT_RESUME_HTTP=1
 export MINIAGENT_RESUME_FILE=/tmp/miniagent_resume
-export MINIAGENT_HOLD_SECS=3600 
+export MINIAGENT_HOLD_SECS=3600
 
 # IMPORTANT: Set your actual token here
-if [ -z "$MINIAGENT_TOKEN" ]; then
+if [ "$MINIAGENT_TOKEN" = "change-me" ]; then
     echo "WARNING: MINIAGENT_TOKEN is not set!"
     echo "Please set it before running Playwright tests:"
     echo "  export MINIAGENT_TOKEN=\"your-shared-token-here\""

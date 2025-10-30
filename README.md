@@ -68,12 +68,19 @@ Add to `~/.bashrc` or `~/.zshrc`:
 
 ```bash
 # MiniAgent configuration
-export PYTHONPATH="/home/mohamed/detector-rdpbridge:$PYTHONPATH"
+export PYTHONPATH="/path/to/detector-rdpbridge:$PYTHONPATH"
 export MINIAGENT_ENABLED=1
 export MINIAGENT_WS_URL="ws://127.0.0.1:8777/ws"
-export MINIAGENT_TOKEN="your-shared-token-here"
+export MINIAGENT_TOKEN="change-me"
 export MINIAGENT_CLIENT="python-cdp-monitor"
-export MINIAGENT_COOLDOWN_SEC=20
+export MINIAGENT_COOLDOWN_SEC=0
+export MINIAGENT_DEBUG_PORT=9222
+export MINIAGENT_FORCE_DEBUG_PORT=1
+export MINIAGENT_ON_ERROR=hold
+export MINIAGENT_RESUME_HTTP=1
+export MINIAGENT_RESUME_HTTP_TOKEN="change-me"
+export MINIAGENT_RESUME_FILE=/tmp/miniagent_resume
+export MINIAGENT_HOLD_SECS=3600
 # Optional: redact URLs/titles in support requests
 # export MINIAGENT_REDACT_URLS=1
 ```
@@ -89,12 +96,19 @@ Add to your PowerShell profile (`$PROFILE`):
 
 ```powershell
 # MiniAgent configuration
-$env:PYTHONPATH = "C:\Users\YourUser\detector-rdpbridge;$env:PYTHONPATH"
+$env:PYTHONPATH = "E:\detector-rdpbridge;$env:PYTHONPATH"
 $env:MINIAGENT_ENABLED = "1"
 $env:MINIAGENT_WS_URL = "ws://127.0.0.1:8777/ws"
-$env:MINIAGENT_TOKEN = "your-shared-token-here"
+$env:MINIAGENT_TOKEN = "change-me"
 $env:MINIAGENT_CLIENT = "python-cdp-monitor"
-$env:MINIAGENT_COOLDOWN_SEC = "20"
+$env:MINIAGENT_COOLDOWN_SEC = "0"
+$env:MINIAGENT_DEBUG_PORT = "9222"
+$env:MINIAGENT_FORCE_DEBUG_PORT = "1"
+$env:MINIAGENT_ON_ERROR = "hold"
+$env:MINIAGENT_RESUME_HTTP = "1"
+$env:MINIAGENT_RESUME_HTTP_TOKEN = "change-me"
+$env:MINIAGENT_RESUME_FILE = "$env:TEMP\miniagent_resume"
+$env:MINIAGENT_HOLD_SECS = "3600"
 ```
 
 Or set system/user environment variables via System Properties → Advanced → Environment Variables.
@@ -105,12 +119,19 @@ Create a batch file to set variables before running tests:
 
 ```batch
 @echo off
-set PYTHONPATH=C:\Users\YourUser\detector-rdpbridge;%PYTHONPATH%
+set PYTHONPATH=E:\detector-rdpbridge;%PYTHONPATH%
 set MINIAGENT_ENABLED=1
 set MINIAGENT_WS_URL=ws://127.0.0.1:8777/ws
-set MINIAGENT_TOKEN=your-shared-token-here
+set MINIAGENT_TOKEN=change-me
 set MINIAGENT_CLIENT=python-cdp-monitor
-set MINIAGENT_COOLDOWN_SEC=20
+set MINIAGENT_COOLDOWN_SEC=0
+set MINIAGENT_DEBUG_PORT=9222
+set MINIAGENT_FORCE_DEBUG_PORT=1
+set MINIAGENT_ON_ERROR=hold
+set MINIAGENT_RESUME_HTTP=1
+set MINIAGENT_RESUME_HTTP_TOKEN=change-me
+set MINIAGENT_RESUME_FILE=%TEMP%\miniagent_resume
+set MINIAGENT_HOLD_SECS=3600
 
 REM Run your test
 python my_playwright.py

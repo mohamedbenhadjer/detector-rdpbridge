@@ -25,11 +25,14 @@ def main():
     
     # Check PYTHONPATH
     print("1. Checking PYTHONPATH...")
-    expected_dir = "/home/mohamed/detector-rdpbridge"
+    expected_dir = os.path.dirname(os.path.abspath(__file__))
     in_path = any(expected_dir in p for p in sys.path)
     all_ok &= check_mark(in_path, f"'{expected_dir}' in PYTHONPATH")
     if not in_path:
-        print(f"   → Add to PYTHONPATH: export PYTHONPATH=\"{expected_dir}:$PYTHONPATH\"")
+        if sys.platform == "win32":
+            print(f"   → Add to PYTHONPATH: set PYTHONPATH={expected_dir};%PYTHONPATH%")
+        else:
+            print(f"   → Add to PYTHONPATH: export PYTHONPATH=\"{expected_dir}:$PYTHONPATH\"")
     print()
     
     # Check if sitecustomize can be imported
