@@ -326,26 +326,48 @@ def _intercept_playwright():
         """Wrap a method to catch and report Playwright exceptions."""
         orig_method = getattr(cls, method_name)
         
+        def _resolve_page_obj(obj):
+            """Resolve Page object from Page or Locator instances."""
+            try:
+                # If it's already a Page (sync or async), we're done
+                if isinstance(obj, (SyncPage, AsyncPage)):
+                    return obj
+                # Common Locator links
+                if hasattr(obj, "page"):
+                    return obj.page
+                if hasattr(obj, "_page"):
+                    return obj._page
+                # Fallback via frame → page
+                if hasattr(obj, "_frame") and hasattr(obj._frame, "page"):
+                    return obj._frame.page
+            except Exception:
+                pass
+            return None
+        
         def _sync_wrapper(self, *args, **kwargs):
             try:
                 return orig_method(self, *args, **kwargs)
             except (PlaywrightTimeoutError, PlaywrightError, AssertionError) as e:
-                # Extract page info if this is a Page method
-                page_info = _get_page_info(self) if isinstance(self, (SyncPage, AsyncPage)) else {}
+                # Resolve page object from Page or Locator
+                page_obj = _resolve_page_obj(self)
+                page_info = _get_page_info(page_obj) if page_obj else {}
                 
-                # Get browser info
+                # Get browser info from resolved page
                 browser_info = {"browser": "chromium", "debug_port": None}
                 try:
-                    # Try to find browser from page
-                    if hasattr(self, "context") and hasattr(self.context, "browser"):
-                        browser_obj = self.context.browser
-                        if browser_obj and id(browser_obj) in _browser_info:
-                            browser_info = _browser_info[id(browser_obj)]
+                    if page_obj and hasattr(page_obj, "context"):
+                        ctx = page_obj.context
+                        # Try via Browser → mapping
+                        if hasattr(ctx, "browser") and ctx.browser and id(ctx.browser) in _browser_info:
+                            browser_info = _browser_info[id(ctx.browser)]
+                        # Persistent context path stores mapping by context id
+                        elif id(ctx) in _browser_info:
+                            browser_info = _browser_info[id(ctx)]
+                    # Fallback: detect browser type off the object if needed
                     elif hasattr(self, "_impl") and hasattr(self._impl, "_browser_type"):
-                        # Fallback: detect from browser type
                         bt_name = self._impl._browser_type.name
                         browser_info["browser"] = bt_name if bt_name in ("firefox", "webkit") else "chromium"
-                except:
+                except Exception:
                     pass
                 
                 # Determine error type
@@ -376,15 +398,26 @@ def _intercept_playwright():
             try:
                 return await orig_method(self, *args, **kwargs)
             except (PlaywrightTimeoutError, PlaywrightError, AssertionError) as e:
-                page_info = _get_page_info(self) if isinstance(self, (SyncPage, AsyncPage)) else {}
+                # Resolve page object from Page or Locator
+                page_obj = _resolve_page_obj(self)
+                page_info = _get_page_info(page_obj) if page_obj else {}
                 
+                # Get browser info from resolved page
                 browser_info = {"browser": "chromium", "debug_port": None}
                 try:
-                    if hasattr(self, "context") and hasattr(self.context, "browser"):
-                        browser_obj = self.context.browser
-                        if browser_obj and id(browser_obj) in _browser_info:
-                            browser_info = _browser_info[id(browser_obj)]
-                except:
+                    if page_obj and hasattr(page_obj, "context"):
+                        ctx = page_obj.context
+                        # Try via Browser → mapping
+                        if hasattr(ctx, "browser") and ctx.browser and id(ctx.browser) in _browser_info:
+                            browser_info = _browser_info[id(ctx.browser)]
+                        # Persistent context path stores mapping by context id
+                        elif id(ctx) in _browser_info:
+                            browser_info = _browser_info[id(ctx)]
+                    # Fallback: detect browser type off the object if needed
+                    elif hasattr(self, "_impl") and hasattr(self._impl, "_browser_type"):
+                        bt_name = self._impl._browser_type.name
+                        browser_info["browser"] = bt_name if bt_name in ("firefox", "webkit") else "chromium"
+                except Exception:
                     pass
                 
                 error_type = type(e).__name__

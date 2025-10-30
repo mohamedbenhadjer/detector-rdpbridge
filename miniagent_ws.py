@@ -198,7 +198,7 @@ class MiniAgentWSClient:
 class SupportRequestManager:
     """Manages support request triggers with deduplication and cooldown."""
     
-    def __init__(self, ws_client: MiniAgentWSClient, cooldown_sec: int = 20, redact_urls: bool = False):
+    def __init__(self, ws_client: MiniAgentWSClient, cooldown_sec: int = 0, redact_urls: bool = False):
         self.ws_client = ws_client
         self.cooldown_sec = cooldown_sec
         self.redact_urls = redact_urls
@@ -257,7 +257,7 @@ class SupportRequestManager:
         
         control_target = {"browser": browser}
         
-        if debug_port:
+        if debug_port is not None:
             control_target["debugPort"] = debug_port
         
         if url and not self.redact_urls:
@@ -299,7 +299,7 @@ def get_support_manager() -> Optional[SupportRequestManager]:
     ws_url = os.environ.get("MINIAGENT_WS_URL", "ws://127.0.0.1:8777/ws")
     token = os.environ.get("MINIAGENT_TOKEN", "")
     client_name = os.environ.get("MINIAGENT_CLIENT", "python-cdp-monitor")
-    cooldown_sec = int(os.environ.get("MINIAGENT_COOLDOWN_SEC", "20"))
+    cooldown_sec = int(os.environ.get("MINIAGENT_COOLDOWN_SEC", "0"))
     redact_urls = os.environ.get("MINIAGENT_REDACT_URLS", "0") == "1"
     
     if not token:
