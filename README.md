@@ -227,6 +227,8 @@ The hook catches:
 - ✅ Navigation timeouts and failures
 - ✅ Selector errors (element not visible, not enabled, etc.)
 
+**Note:** Both `Page` method errors (e.g., `page.click()`) and `Locator` method errors (e.g., `page.locator().click()`) include full CDP criteria (`debugPort`, `urlContains`, `titleContains`) for accurate tab targeting.
+
 ## Troubleshooting
 
 ### Hook not activating
@@ -254,6 +256,15 @@ python -c "import sitecustomize"
 1. Check cooldown period (default 20s between duplicate requests)
 2. Verify Flutter has a signed-in user (returns `NO_USER` error otherwise)
 3. Check for `BAD_AUTH` errors (token mismatch)
+
+### CDP not connecting to correct tab
+
+If Flutter connects to the wrong browser window/tab:
+
+1. Verify the error includes `debugPort`, `urlContains`, and `titleContains` in logs
+2. Both Page and Locator errors should include full CDP criteria
+3. If missing, check that `MINIAGENT_REDACT_URLS=1` is not set (would hide URL/title)
+4. Run `tests/test_locator_error_payload.py` to verify payload structure
 
 ### Remote debugging port configuration
 
