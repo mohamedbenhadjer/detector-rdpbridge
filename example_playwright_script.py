@@ -51,7 +51,15 @@ def google_search_test():
     with sync_playwright() as p:
         # Launch browser (hook will inject debug port for Chromium)
         print("STEP 1: Launching Chromium browser...")
-        browser = p.chromium.launch(headless=False, slow_mo=500)
+        browser = p.chromium.launch(
+            headless=False,
+            slow_mo=500,
+            args=[
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding",
+                "--disable-background-timer-throttling",
+            ],
+        )
         page = browser.new_page()
         print("   ✓ Browser launched successfully")
         print()
