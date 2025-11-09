@@ -43,6 +43,51 @@ _RESUME_HTTP_TOKEN = os.environ.get("MINIAGENT_RESUME_HTTP_TOKEN", "").strip()
 _DEBUG_PORT = int(os.environ.get("MINIAGENT_DEBUG_PORT", "9222"))
 _FORCE_DEBUG_PORT = os.environ.get("MINIAGENT_FORCE_DEBUG_PORT", "1") == "1"
 
+# Popup/tab prevention configuration
+_PREVENT_NEW_TABS = os.environ.get("MINIAGENT_PREVENT_NEW_TABS", "1") == "1"
+_ALLOW_NEW_TAB_REGEX = os.environ.get("MINIAGENT_ALLOW_NEW_TAB_REGEX", "").strip()
+_PREVENT_TABS_LOG = os.environ.get("MINIAGENT_PREVENT_TABS_LOG", "0") == "1"
+
+# Parse allowlist regex patterns
+_ALLOW_NEW_TAB_PATTERNS = []
+if _ALLOW_NEW_TAB_REGEX:
+    import re
+    try:
+        _ALLOW_NEW_TAB_PATTERNS = [
+            re.compile(pattern.strip()) 
+            for pattern in _ALLOW_NEW_TAB_REGEX.split(",") 
+            if pattern.strip()
+        ]
+    except Exception as e:
+        logger.warning(f"Failed to parse MINIAGENT_ALLOW_NEW_TAB_REGEX: {e}")
+
+# JavaScript snippet to prevent new tabs/popups
+_POPUP_PREVENTION_SCRIPT = """
+// Override window.open to reuse same tab
+(function() {
+    const originalOpen = window.open;
+    window.open = function(url, target, features) {
+        if (!url || url === 'about:blank' || url === '') {
+            return null;
+        }
+        // Navigate in the same tab
+        setTimeout(() => {
+            window.location.href = url;
+        }, 0);
+        return window;
+    };
+})();
+
+// Intercept clicks on links with target="_blank"
+document.addEventListener('click', (event) => {
+    const link = event.target && event.target.closest && event.target.closest('a[target="_blank"]');
+    if (!link) return;
+    event.preventDefault();
+    event.stopPropagation();
+    window.location.href = link.href;
+}, true);
+"""
+
 
 def _hold_deadline():
     """Compute hold deadline from MINIAGENT_HOLD_SECS env var."""
@@ -175,6 +220,180 @@ def _get_page_info(page_obj) -> Dict[str, Any]:
         pass
     
     return info
+
+
+def _is_url_allowed_for_new_tab(url: Optional[str]) -> bool:
+    """Check if URL matches allowlist patterns for new tab creation."""
+    if not url or not _ALLOW_NEW_TAB_PATTERNS:
+        return False
+    
+    for pattern in _ALLOW_NEW_TAB_PATTERNS:
+        try:
+            if pattern.search(url):
+                return True
+        except Exception:
+            pass
+    
+    return False
+
+
+def _install_popup_prevention_on_page(page_obj):
+    """Install popup prevention on a Playwright Page object (sync or async).
+    
+    Adds init script to override window.open and intercept target="_blank" clicks.
+    Also adds popup handler to immediately close any popups that still appear.
+    """
+    if not _PREVENT_NEW_TABS:
+        return
+    
+    import inspect
+    is_async = inspect.iscoroutinefunction(getattr(page_obj.__class__, 'add_init_script', None))
+    
+    try:
+        # Add init script to override window.open and intercept _blank links
+        if hasattr(page_obj, 'add_init_script'):
+            result = page_obj.add_init_script(_POPUP_PREVENTION_SCRIPT)
+            # If async, we can't await here, but the script will still be added
+            if _PREVENT_TABS_LOG:
+                logger.info(f"Popup prevention script installed on page {id(page_obj)}")
+        
+        # Add popup handler to close any popups that still manage to open
+        if hasattr(page_obj, 'on'):
+            def _popup_handler(popup):
+                try:
+                    popup_url = None
+                    try:
+                        popup_url = popup.url
+                    except:
+                        pass
+                    
+                    # Check if popup URL is in allowlist
+                    if popup_url and _is_url_allowed_for_new_tab(popup_url):
+                        if _PREVENT_TABS_LOG:
+                            logger.info(f"Allowing popup with URL: {popup_url}")
+                        return
+                    
+                    # Close the popup - handle both sync and async
+                    close_result = popup.close()
+                    # If it's a coroutine, schedule it properly
+                    if inspect.iscoroutine(close_result):
+                        import asyncio
+                        try:
+                            loop = asyncio.get_event_loop()
+                            if loop.is_running():
+                                asyncio.create_task(close_result)
+                            else:
+                                loop.run_until_complete(close_result)
+                        except:
+                            # Fallback: let it be garbage collected
+                            pass
+                    
+                    if _PREVENT_TABS_LOG:
+                        logger.info(f"Closed popup with URL: {popup_url or 'unknown'}")
+                except Exception as e:
+                    if _PREVENT_TABS_LOG:
+                        logger.warning(f"Failed to close popup: {e}")
+            
+            page_obj.on("popup", _popup_handler)
+        
+    except Exception as e:
+        logger.warning(f"Failed to configure popup prevention on page: {e}")
+
+
+def _install_popup_prevention_on_context(context_obj):
+    """Install popup prevention on a BrowserContext (sync or async).
+    
+    Attaches a page handler that installs prevention on all new pages.
+    """
+    if not _PREVENT_NEW_TABS:
+        return
+    
+    try:
+        if hasattr(context_obj, 'on'):
+            def _page_handler(page):
+                _install_popup_prevention_on_page(page)
+                if _PREVENT_TABS_LOG:
+                    logger.info(f"Auto-installed popup prevention on new page {id(page)}")
+            
+            context_obj.on("page", _page_handler)
+            if _PREVENT_TABS_LOG:
+                logger.info(f"Popup prevention page handler installed on context {id(context_obj)}")
+    except Exception as e:
+        logger.warning(f"Failed to configure popup prevention on context: {e}")
+
+
+async def _install_popup_prevention_on_page_async(page_obj):
+    """Async version - Install popup prevention on an async Playwright Page object.
+    
+    Adds init script to override window.open and intercept target="_blank" clicks.
+    Also adds popup handler to immediately close any popups that still appear.
+    """
+    if not _PREVENT_NEW_TABS:
+        return
+    
+    try:
+        # Add init script to override window.open and intercept _blank links
+        if hasattr(page_obj, 'add_init_script'):
+            await page_obj.add_init_script(_POPUP_PREVENTION_SCRIPT)
+            if _PREVENT_TABS_LOG:
+                logger.info(f"Popup prevention script installed on async page {id(page_obj)}")
+        
+        # Add popup handler to close any popups that still manage to open
+        if hasattr(page_obj, 'on'):
+            async def _popup_handler(popup):
+                try:
+                    popup_url = None
+                    try:
+                        popup_url = popup.url
+                    except:
+                        pass
+                    
+                    # Check if popup URL is in allowlist
+                    if popup_url and _is_url_allowed_for_new_tab(popup_url):
+                        if _PREVENT_TABS_LOG:
+                            logger.info(f"Allowing popup with URL: {popup_url}")
+                        return
+                    
+                    # Close the popup
+                    await popup.close()
+                    if _PREVENT_TABS_LOG:
+                        logger.info(f"Closed async popup with URL: {popup_url or 'unknown'}")
+                except Exception as e:
+                    if _PREVENT_TABS_LOG:
+                        logger.warning(f"Failed to close async popup: {e}")
+            
+            page_obj.on("popup", _popup_handler)
+        
+    except Exception as e:
+        logger.warning(f"Failed to configure popup prevention on async page: {e}")
+
+
+def _install_popup_prevention_on_context_async(context_obj):
+    """Install popup prevention on an async BrowserContext.
+    
+    Attaches a page handler that installs prevention on all new pages.
+    """
+    if not _PREVENT_NEW_TABS:
+        return
+    
+    try:
+        if hasattr(context_obj, 'on'):
+            def _page_handler(page):
+                # Schedule async installation
+                import asyncio
+                try:
+                    asyncio.create_task(_install_popup_prevention_on_page_async(page))
+                    if _PREVENT_TABS_LOG:
+                        logger.info(f"Scheduled async popup prevention on new page {id(page)}")
+                except Exception as e:
+                    if _PREVENT_TABS_LOG:
+                        logger.warning(f"Failed to schedule async popup prevention: {e}")
+            
+            context_obj.on("page", _page_handler)
+            if _PREVENT_TABS_LOG:
+                logger.info(f"Popup prevention page handler installed on async context {id(context_obj)}")
+    except Exception as e:
+        logger.warning(f"Failed to configure popup prevention on async context: {e}")
 
 
 def _intercept_playwright():
@@ -323,9 +542,112 @@ def _intercept_playwright():
             "debug_port": debug_port
         }
         
+        # Install popup prevention on persistent context
+        _install_popup_prevention_on_context(context)
+        # Install on any existing pages
+        try:
+            for page in context.pages:
+                _install_popup_prevention_on_page(page)
+        except Exception as e:
+            logger.debug(f"Could not install popup prevention on persistent context pages: {e}")
+        
         return context
     
     SyncBrowserType.launch_persistent_context = _patched_sync_launch_persistent
+    
+    # === Popup/Tab prevention patches ===
+    
+    # Import Browser and BrowserContext classes
+    try:
+        from playwright.sync_api import Browser as SyncBrowser, BrowserContext as SyncBrowserContext
+    except ImportError:
+        logger.debug("Could not import sync Browser/BrowserContext for popup prevention")
+        SyncBrowser = None
+        SyncBrowserContext = None
+    
+    # Patch sync BrowserContext.new_page
+    if SyncBrowserContext:
+        _orig_sync_context_new_page = SyncBrowserContext.new_page
+        
+        def _patched_sync_context_new_page(self, *args, **kwargs):
+            page = _orig_sync_context_new_page(self, *args, **kwargs)
+            _install_popup_prevention_on_page(page)
+            return page
+        
+        SyncBrowserContext.new_page = _patched_sync_context_new_page
+        logger.debug("Patched sync BrowserContext.new_page for popup prevention")
+    
+    # Patch sync Browser.new_context
+    if SyncBrowser:
+        _orig_sync_browser_new_context = SyncBrowser.new_context
+        
+        def _patched_sync_browser_new_context(self, *args, **kwargs):
+            context = _orig_sync_browser_new_context(self, *args, **kwargs)
+            _install_popup_prevention_on_context(context)
+            return context
+        
+        SyncBrowser.new_context = _patched_sync_browser_new_context
+        logger.debug("Patched sync Browser.new_context for popup prevention")
+        
+        # Patch sync Browser.new_page (creates implicit context + page)
+        _orig_sync_browser_new_page = SyncBrowser.new_page
+        
+        def _patched_sync_browser_new_page(self, *args, **kwargs):
+            page = _orig_sync_browser_new_page(self, *args, **kwargs)
+            # Install on page and also on its context for future pages
+            _install_popup_prevention_on_page(page)
+            if hasattr(page, 'context'):
+                _install_popup_prevention_on_context(page.context)
+            return page
+        
+        SyncBrowser.new_page = _patched_sync_browser_new_page
+        logger.debug("Patched sync Browser.new_page for popup prevention")
+    
+    # Import async Browser and BrowserContext classes
+    try:
+        from playwright.async_api import Browser as AsyncBrowser, BrowserContext as AsyncBrowserContext
+    except ImportError:
+        logger.debug("Could not import async Browser/BrowserContext for popup prevention")
+        AsyncBrowser = None
+        AsyncBrowserContext = None
+    
+    # Patch async BrowserContext.new_page
+    if AsyncBrowserContext:
+        _orig_async_context_new_page = AsyncBrowserContext.new_page
+        
+        async def _patched_async_context_new_page(self, *args, **kwargs):
+            page = await _orig_async_context_new_page(self, *args, **kwargs)
+            await _install_popup_prevention_on_page_async(page)
+            return page
+        
+        AsyncBrowserContext.new_page = _patched_async_context_new_page
+        logger.debug("Patched async BrowserContext.new_page for popup prevention")
+    
+    # Patch async Browser.new_context
+    if AsyncBrowser:
+        _orig_async_browser_new_context = AsyncBrowser.new_context
+        
+        async def _patched_async_browser_new_context(self, *args, **kwargs):
+            context = await _orig_async_browser_new_context(self, *args, **kwargs)
+            _install_popup_prevention_on_context_async(context)
+            return context
+        
+        AsyncBrowser.new_context = _patched_async_browser_new_context
+        logger.debug("Patched async Browser.new_context for popup prevention")
+        
+        # Patch async Browser.new_page (creates implicit context + page)
+        _orig_async_browser_new_page = AsyncBrowser.new_page
+        
+        async def _patched_async_browser_new_page(self, *args, **kwargs):
+            page = await _orig_async_browser_new_page(self, *args, **kwargs)
+            # Install on page and also on its context for future pages
+            await _install_popup_prevention_on_page_async(page)
+            if hasattr(page, 'context'):
+                _install_popup_prevention_on_context_async(page.context)
+            return page
+        
+        AsyncBrowser.new_page = _patched_async_browser_new_page
+        logger.debug("Patched async Browser.new_page for popup prevention")
     
     # === Error interception ===
     
