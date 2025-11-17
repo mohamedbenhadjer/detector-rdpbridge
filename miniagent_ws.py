@@ -219,7 +219,8 @@ class SupportRequestManager:
         debug_port: Optional[int] = None,
         url: Optional[str] = None,
         title: Optional[str] = None,
-        page_id: Optional[str] = None
+        page_id: Optional[str] = None,
+        resume_endpoint: Optional[Dict[str, Any]] = None
     ):
         """
         Trigger a support request with deduplication.
@@ -232,6 +233,7 @@ class SupportRequestManager:
             url: Current page URL
             title: Current page title
             page_id: Unique page identifier for deduplication
+            resume_endpoint: Optional dict with resume endpoint info (scheme, host, port, path, token)
         """
         page_id = page_id or "default"
         
@@ -265,6 +267,9 @@ class SupportRequestManager:
         
         if title and not self.redact_urls:
             control_target["titleContains"] = title[:100]
+        
+        if resume_endpoint is not None:
+            control_target["resumeEndpoint"] = resume_endpoint
         
         meta = {
             "runId": self.run_id,
