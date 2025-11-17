@@ -10,6 +10,7 @@ import time
 import asyncio
 import threading
 import json
+import socket
 from pathlib import Path
 from typing import Optional, Any, Dict
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -87,6 +88,29 @@ document.addEventListener('click', (event) => {
     window.location.href = link.href;
 }, true);
 """
+
+
+def _find_free_debug_port(base_port: int, max_attempts: int = 50) -> int:
+    """
+    Find a free port starting from base_port by probing base_port, base_port+1, etc.
+    Returns the first free port found, or base_port if none found (with warning).
+    """
+    for offset in range(max_attempts):
+        port = base_port + offset
+        try:
+            # Try to bind to the port to check if it's free
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("127.0.0.1", port))
+                logger.debug(f"Found free debug port: {port}")
+                return port
+        except OSError:
+            # Port is in use, try next one
+            continue
+    
+    # If we exhausted all attempts, warn and fall back to base_port
+    logger.warning(f"Could not find free port in range {base_port}-{base_port + max_attempts - 1}, falling back to {base_port}")
+    return base_port
 
 
 def _hold_deadline():
@@ -428,10 +452,14 @@ def _intercept_playwright():
     
     # === Chromium debug port injection ===
     
-    def _inject_debug_args(args: list, browser_name: str) -> list:
-        """Inject remote debugging flags for Chromium-based browsers."""
+    def _inject_debug_args(args: list, browser_name: str) -> tuple:
+        """Inject remote debugging flags for Chromium-based browsers.
+        
+        Returns:
+            tuple: (modified_args, chosen_debug_port) where chosen_debug_port is None for non-Chromium browsers
+        """
         if browser_name not in ("chromium", "chrome", "msedge"):
-            return args
+            return args, None
         
         args = list(args) if args else []
         
@@ -442,12 +470,24 @@ def _intercept_playwright():
         
         # Check if debug port already set (after potential removal)
         has_debug = any("--remote-debugging-port" in str(arg) for arg in args)
+        chosen_port = None
         if not has_debug:
+            # Find a free port dynamically
+            chosen_port = _find_free_debug_port(_DEBUG_PORT)
             args.extend([
                 "--remote-debugging-address=127.0.0.1",
-                f"--remote-debugging-port={_DEBUG_PORT}"
+                f"--remote-debugging-port={chosen_port}"
             ])
-            logger.debug(f"Injected remote debugging flags (port {_DEBUG_PORT})")
+            logger.debug(f"Injected remote debugging flags (port {chosen_port})")
+        else:
+            # Port was already set by user, extract it
+            for arg in args:
+                if "--remote-debugging-port" in str(arg):
+                    try:
+                        chosen_port = int(str(arg).split("=")[1])
+                    except:
+                        chosen_port = _DEBUG_PORT
+                    break
         
         # Add flags to keep background/occluded tabs rendering
         args.extend([
@@ -456,7 +496,7 @@ def _intercept_playwright():
             "--disable-background-timer-throttling",
         ])
         
-        return args
+        return args, chosen_port
     
     def _read_devtools_port(user_data_dir: Optional[Path]) -> Optional[int]:
         """Read the DevToolsActivePort file to get the actual debug port."""
@@ -482,18 +522,17 @@ def _intercept_playwright():
     def _patched_sync_launch(self, *args, **kwargs):
         browser_name = self.name
         
-        # Inject debug args for Chromium
+        # Inject debug args for Chromium and capture chosen port
+        debug_port = None
         if "args" in kwargs:
-            kwargs["args"] = _inject_debug_args(kwargs["args"], browser_name)
+            kwargs["args"], debug_port = _inject_debug_args(kwargs["args"], browser_name)
         elif browser_name in ("chromium", "chrome", "msedge"):
-            kwargs["args"] = _inject_debug_args([], browser_name)
+            kwargs["args"], debug_port = _inject_debug_args([], browser_name)
         
         browser = _orig_sync_launch(self, *args, **kwargs)
         
-        # Set debug port for Chromium (we know it because we set it)
-        debug_port = None
+        # Store browser info with the actual debug port used
         if browser_name in ("chromium", "chrome", "msedge"):
-            debug_port = _DEBUG_PORT
             _browser_info[id(browser)] = {
                 "browser": browser_name,
                 "debug_port": debug_port
@@ -515,25 +554,25 @@ def _intercept_playwright():
     def _patched_sync_launch_persistent(self, user_data_dir, *args, **kwargs):
         browser_name = self.name
         
-        # Inject debug args for Chromium
+        # Inject debug args for Chromium and capture chosen port
+        debug_port = None
         if "args" in kwargs:
-            kwargs["args"] = _inject_debug_args(kwargs["args"], browser_name)
+            kwargs["args"], debug_port = _inject_debug_args(kwargs["args"], browser_name)
         elif browser_name in ("chromium", "chrome", "msedge"):
-            kwargs["args"] = _inject_debug_args([], browser_name)
+            kwargs["args"], debug_port = _inject_debug_args([], browser_name)
         
         context = _orig_sync_launch_persistent(self, user_data_dir, *args, **kwargs)
         
-        # Set debug port for Chromium (we know it because we set it)
-        debug_port = None
+        # Set debug port for Chromium (use the port we chose)
         if browser_name in ("chromium", "chrome", "msedge"):
-            debug_port = _DEBUG_PORT
-            
             # Sanity check: read DevToolsActivePort file if available
             import time
             time.sleep(0.5)  # Give Chrome time to write the file
             detected_port = _read_devtools_port(Path(user_data_dir))
             if detected_port and detected_port != debug_port:
                 logger.warning(f"DevToolsActivePort mismatch: configured={debug_port}, detected={detected_port}")
+                # Use detected port if it differs (Chrome may have chosen different port)
+                debug_port = detected_port
             
             logger.info(f"Chromium persistent context launched with debug port {debug_port}")
         
