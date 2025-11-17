@@ -32,12 +32,14 @@ _patched = False
 # Error handling mode configuration
 _MODE = os.environ.get("MINIAGENT_ON_ERROR", "report").lower()  # report|hold|swallow
 _HOLD_RAW = os.environ.get("MINIAGENT_HOLD_SECS", "").strip().lower()
-_RESUME_FILE = os.environ.get("MINIAGENT_RESUME_FILE", "/tmp/miniagent_resume")
+_RESUME_FILE_BASE = os.environ.get("MINIAGENT_RESUME_FILE", "/tmp/miniagent_resume")
+_RESUME_FILE = f"{_RESUME_FILE_BASE}_{os.getpid()}"  # Per-process resume file
 
 # Optional HTTP resume endpoint configuration
 _RESUME_HTTP_ENABLED = os.environ.get("MINIAGENT_RESUME_HTTP", "0") == "1"
 _RESUME_HTTP_HOST = os.environ.get("MINIAGENT_RESUME_HTTP_HOST", "127.0.0.1")
-_RESUME_HTTP_PORT = int(os.environ.get("MINIAGENT_RESUME_HTTP_PORT", "8787"))
+_RESUME_HTTP_PORT_BASE = int(os.environ.get("MINIAGENT_RESUME_HTTP_PORT", "8787"))
+_RESUME_HTTP_PORT = _RESUME_HTTP_PORT_BASE  # Will be updated to actual chosen port
 _RESUME_HTTP_TOKEN = os.environ.get("MINIAGENT_RESUME_HTTP_TOKEN", "").strip()
 
 # Remote debugging port configuration
@@ -207,7 +209,10 @@ class _ResumeRequestHandler(BaseHTTPRequestHandler):
 def _start_resume_http_server():
     """Start a daemonized HTTP server that exposes POST /resume.
     Only starts when MINIAGENT_RESUME_HTTP=1 and a token is configured.
+    Uses dynamic port selection to allow multiple processes.
     """
+    global _RESUME_HTTP_PORT
+    
     if not _RESUME_HTTP_ENABLED:
         return
 
@@ -215,6 +220,10 @@ def _start_resume_http_server():
         logger.error("Resume HTTP enabled but MINIAGENT_RESUME_HTTP_TOKEN is not set; not starting HTTP server")
         return
 
+    # Find a free port dynamically
+    chosen_port = _find_free_debug_port(_RESUME_HTTP_PORT_BASE)
+    _RESUME_HTTP_PORT = chosen_port
+    
     try:
         httpd = HTTPServer((_RESUME_HTTP_HOST, _RESUME_HTTP_PORT), _ResumeRequestHandler)
     except Exception as e:
@@ -742,6 +751,17 @@ def _intercept_playwright():
                 error_type = type(e).__name__
                 error_msg = str(e)[:200]
                 
+                # Build resume endpoint info if HTTP resume is enabled
+                resume_endpoint = None
+                if _RESUME_HTTP_ENABLED and _RESUME_HTTP_TOKEN:
+                    resume_endpoint = {
+                        "scheme": "http",
+                        "host": _RESUME_HTTP_HOST,
+                        "port": _RESUME_HTTP_PORT,
+                        "path": "/resume",
+                        "token": _RESUME_HTTP_TOKEN
+                    }
+                
                 # Trigger support request
                 manager.trigger_support_request(
                     reason=error_type,
@@ -750,7 +770,8 @@ def _intercept_playwright():
                     debug_port=browser_info.get("debug_port"),
                     url=page_info.get("url"),
                     title=page_info.get("title"),
-                    page_id=page_info.get("page_id")
+                    page_id=page_info.get("page_id"),
+                    resume_endpoint=resume_endpoint
                 )
                 
                 # Handle based on mode
@@ -791,6 +812,17 @@ def _intercept_playwright():
                 error_type = type(e).__name__
                 error_msg = str(e)[:200]
                 
+                # Build resume endpoint info if HTTP resume is enabled
+                resume_endpoint = None
+                if _RESUME_HTTP_ENABLED and _RESUME_HTTP_TOKEN:
+                    resume_endpoint = {
+                        "scheme": "http",
+                        "host": _RESUME_HTTP_HOST,
+                        "port": _RESUME_HTTP_PORT,
+                        "path": "/resume",
+                        "token": _RESUME_HTTP_TOKEN
+                    }
+                
                 manager.trigger_support_request(
                     reason=error_type,
                     details=f"{method_name}: {error_msg}",
@@ -798,7 +830,8 @@ def _intercept_playwright():
                     debug_port=browser_info.get("debug_port"),
                     url=page_info.get("url"),
                     title=page_info.get("title"),
-                    page_id=page_info.get("page_id")
+                    page_id=page_info.get("page_id"),
+                    resume_endpoint=resume_endpoint
                 )
                 
                 # Handle based on mode
