@@ -4,6 +4,22 @@ Example Playwright script to demonstrate the MiniAgent hook.
 This script intentionally has errors to trigger support requests.
 
 NO MODIFICATIONS NEEDED - the hook intercepts errors automatically!
+
+=== FOR HUMAN AGENTS ===
+When this script fails, the RDP Host receives TWO critical pieces of info:
+1. detection.successSelector - The EXACT element the Host watches for to detect success
+   Example: "text=Agent Success"
+2. description - Includes "| successSelector=..." so YOU know what to make appear
+
+YOUR JOB as the agent:
+- Read the error description to see what selector is needed
+- Perform actions in the browser that make that selector appear on the page
+- When the selector appears, the RDP Host will automatically mark the session as successful
+
+Example: If successSelector="text=Agent Success"
+→ Type "Agent Success" in Google's search bar and hit Enter
+→ The text appears on the page → RDP Host detects success!
+========================
 """
 from playwright.sync_api import sync_playwright
 import time
@@ -41,9 +57,10 @@ def google_search_test():
     print()
     print("This script will:")
     print("  • Open Google.com")
-    print("  • Search for a phone number field (intentional failure)")
+    print("  • Wait for 'Agent Success' (which isn't there yet)")
     print("  • Trigger the MiniAgent support request")
-    print("  • Display completion banner")
+    print("  • YOU (the Agent) will search for 'Agent Success'")
+    print("  • The script will detect success!")
     print()
     print("-" * 70)
     print()
@@ -66,24 +83,27 @@ def google_search_test():
         
         # Navigate to Google
         print("STEP 2: Navigating to Google.com...")
-        page.goto("https://www.google.com")
+        page.goto("https://duckduckgo.com")
         print(f"   ✓ Current URL: {page.url}")
         print(f"   ✓ Page Title: {page.title()}")
         print()
         
         time.sleep(1)
         
-        # Purposely fail - search for phone number field
-        print("STEP 3: Searching for phone number field...")
-        print("   (This field doesn't exist - will trigger agent request)")
+        # Purposely fail - wait for "Agent Success" text
+        print("STEP 3: Waiting for 'Agent Success' text...")
+        print("   (This text doesn't exist yet - will trigger agent request)")
+        print("   ACTION REQUIRED: When the browser opens, type 'Agent Success' in Google and search!")
         try:
-            # Try to find a phone number input field that doesn't exist
-            page.fill("input[type='tel']", "+1234567890", timeout=5000)
-            print("   ✓ Phone field found (unexpected!)")
+            # Try to find text that isn't there yet
+            # The Agent (you) must type this into the search bar to make it appear
+            page.wait_for_selector("text=Agent Success", timeout=5000)
+            print("   ✓ 'Agent Success' found! (Detection worked!)")
         except Exception as e:
             print(f"   ✗ Error caught: {type(e).__name__}")
             print(f"   ✗ Message: {str(e)[:100]}...")
             print(f"   → MiniAgent support request sent automatically!")
+            print(f"   → RDP Host is now watching for: 'text=Agent Success'")
             print()
         
         time.sleep(2)
@@ -105,6 +125,3 @@ def google_search_test():
 
 if __name__ == "__main__":
     google_search_test()
-
-
-

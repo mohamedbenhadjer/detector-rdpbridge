@@ -11,6 +11,7 @@ import asyncio
 import threading
 import json
 import socket
+import urllib.request
 from pathlib import Path
 from typing import Optional, Any, Dict
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -113,6 +114,44 @@ def _find_free_debug_port(base_port: int, max_attempts: int = 50) -> int:
     # If we exhausted all attempts, warn and fall back to base_port
     logger.warning(f"Could not find free port in range {base_port}-{base_port + max_attempts - 1}, falling back to {base_port}")
     return base_port
+
+
+def _get_cdp_target_id(debug_port: int, page_url: str) -> Optional[str]:
+    """
+    Query DevTools Protocol to find target ID matching the page URL.
+    
+    Args:
+        debug_port: The Chrome DevTools remote debugging port
+        page_url: The current page URL to match
+    
+    Returns:
+        The CDP target ID if found, None otherwise
+    """
+    if not debug_port or not page_url:
+        return None
+    
+    try:
+        url = f"http://127.0.0.1:{debug_port}/json/list"
+        with urllib.request.urlopen(url, timeout=0.5) as response:
+            targets = json.loads(response.read().decode())
+            
+            # Try exact match first
+            for target in targets:
+                if target.get("type") == "page" and target.get("url") == page_url:
+                    logger.debug(f"Found CDP target ID (exact match): {target.get('id')}")
+                    return target.get("id")
+            
+            # Try match ignoring trailing slash
+            norm_url = page_url.rstrip("/")
+            for target in targets:
+                target_url = target.get("url", "").rstrip("/")
+                if target.get("type") == "page" and target_url == norm_url:
+                    logger.debug(f"Found CDP target ID (normalized match): {target.get('id')}")
+                    return target.get("id")
+    except Exception as e:
+        logger.debug(f"Failed to resolve CDP target ID: {e}")
+    
+    return None
 
 
 def _hold_deadline():
@@ -253,6 +292,76 @@ def _get_page_info(page_obj) -> Dict[str, Any]:
         pass
     
     return info
+
+
+def _extract_detection_selectors(method_name: str, obj, args: tuple, kwargs: dict) -> tuple:
+    """
+    Extract success/failure selectors from a Playwright method call.
+    
+    Args:
+        method_name: Name of the method being called (e.g., "click", "fill")
+        obj: The Page or Locator object
+        args: Positional arguments to the method
+        kwargs: Keyword arguments to the method
+    
+    Returns:
+        Tuple of (success_selector, failure_selector) where either can be None
+    """
+    success_selector = None
+    failure_selector = None
+    
+    try:
+        # Determine if obj is a Locator or Page
+        is_locator = False
+        try:
+            # Check if it's a Locator by looking for common Locator attributes
+            if hasattr(obj, '_impl_obj') and hasattr(obj._impl_obj, '_selector'):
+                is_locator = True
+            elif hasattr(obj, '_impl') and hasattr(obj._impl, '_selector'):
+                is_locator = True
+            elif hasattr(obj, '_selector'):
+                is_locator = True
+        except:
+            pass
+        
+        if is_locator:
+            # For Locator methods, extract the selector from the Locator itself
+            try:
+                # Try _impl_obj._selector first (sync Locator)
+                if hasattr(obj, '_impl_obj') and hasattr(obj._impl_obj, '_selector'):
+                    success_selector = obj._impl_obj._selector
+                # Try _impl._selector (older Playwright versions or async)
+                elif hasattr(obj, '_impl') and hasattr(obj._impl, '_selector'):
+                    success_selector = obj._impl._selector
+                # Try _selector directly
+                elif hasattr(obj, '_selector'):
+                    success_selector = obj._selector
+                else:
+                    # Fallback: parse from repr
+                    repr_str = repr(obj)
+                    if "locator(" in repr_str.lower():
+                        # Try to extract selector from repr like "<Locator frame=<Frame ...> selector='button'>""
+                        import re
+                        match = re.search(r"selector=['\"]([^'\"]+)['\"]", repr_str)
+                        if match:
+                            success_selector = match.group(1)
+            except:
+                pass
+        else:
+            # For Page methods, check if first arg or 'selector' kwarg contains a selector
+            selector_methods = ["click", "fill", "press", "type", "select_option", "check", 
+                              "uncheck", "wait_for_selector"]
+            
+            if method_name in selector_methods:
+                # First positional arg is typically the selector
+                if args and len(args) > 0 and isinstance(args[0], str):
+                    success_selector = args[0]
+                elif "selector" in kwargs and isinstance(kwargs["selector"], str):
+                    success_selector = kwargs["selector"]
+    except:
+        pass
+    
+    return success_selector, failure_selector
 
 
 def _is_url_allowed_for_new_tab(url: Optional[str]) -> bool:
@@ -751,6 +860,11 @@ def _intercept_playwright():
                 error_type = type(e).__name__
                 error_msg = str(e)[:200]
                 
+                # Try to resolve CDP Target ID for Chromium browsers
+                cdp_target_id = None
+                if browser_info.get("debug_port") and page_info.get("url"):
+                    cdp_target_id = _get_cdp_target_id(browser_info["debug_port"], page_info["url"])
+                
                 # Build resume endpoint info if HTTP resume is enabled
                 resume_endpoint = None
                 if _RESUME_HTTP_ENABLED and _RESUME_HTTP_TOKEN:
@@ -762,16 +876,29 @@ def _intercept_playwright():
                         "token": _RESUME_HTTP_TOKEN
                     }
                 
+                # Extract detection selectors
+                success_selector, failure_selector = _extract_detection_selectors(method_name, self, args, kwargs)
+                
+                # Build details string including selectors for human readability
+                details = f"{method_name}: {error_msg}"
+                if success_selector:
+                    details += f" | successSelector={success_selector}"
+                if failure_selector:
+                    details += f" | failureSelector={failure_selector}"
+                
                 # Trigger support request
                 manager.trigger_support_request(
                     reason=error_type,
-                    details=f"{method_name}: {error_msg}",
+                    details=details,
                     browser=browser_info["browser"],
                     debug_port=browser_info.get("debug_port"),
                     url=page_info.get("url"),
                     title=page_info.get("title"),
                     page_id=page_info.get("page_id"),
-                    resume_endpoint=resume_endpoint
+                    resume_endpoint=resume_endpoint,
+                    success_selector=success_selector,
+                    failure_selector=failure_selector,
+                    cdp_target_id=cdp_target_id
                 )
                 
                 # Handle based on mode
@@ -812,6 +939,11 @@ def _intercept_playwright():
                 error_type = type(e).__name__
                 error_msg = str(e)[:200]
                 
+                # Try to resolve CDP Target ID for Chromium browsers
+                cdp_target_id = None
+                if browser_info.get("debug_port") and page_info.get("url"):
+                    cdp_target_id = _get_cdp_target_id(browser_info["debug_port"], page_info["url"])
+                
                 # Build resume endpoint info if HTTP resume is enabled
                 resume_endpoint = None
                 if _RESUME_HTTP_ENABLED and _RESUME_HTTP_TOKEN:
@@ -823,15 +955,28 @@ def _intercept_playwright():
                         "token": _RESUME_HTTP_TOKEN
                     }
                 
+                # Extract detection selectors
+                success_selector, failure_selector = _extract_detection_selectors(method_name, self, args, kwargs)
+                
+                # Build details string including selectors for human readability
+                details = f"{method_name}: {error_msg}"
+                if success_selector:
+                    details += f" | successSelector={success_selector}"
+                if failure_selector:
+                    details += f" | failureSelector={failure_selector}"
+                
                 manager.trigger_support_request(
                     reason=error_type,
-                    details=f"{method_name}: {error_msg}",
+                    details=details,
                     browser=browser_info["browser"],
                     debug_port=browser_info.get("debug_port"),
                     url=page_info.get("url"),
                     title=page_info.get("title"),
                     page_id=page_info.get("page_id"),
-                    resume_endpoint=resume_endpoint
+                    resume_endpoint=resume_endpoint,
+                    success_selector=success_selector,
+                    failure_selector=failure_selector,
+                    cdp_target_id=cdp_target_id
                 )
                 
                 # Handle based on mode
