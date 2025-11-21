@@ -4,22 +4,6 @@ Example Playwright script to demonstrate the MiniAgent hook.
 This script intentionally has errors to trigger support requests.
 
 NO MODIFICATIONS NEEDED - the hook intercepts errors automatically!
-
-=== FOR HUMAN AGENTS ===
-When this script fails, the RDP Host receives TWO critical pieces of info:
-1. detection.successSelector - The EXACT element the Host watches for to detect success
-   Example: "text=Agent Success"
-2. description - Includes "| successSelector=..." so YOU know what to make appear
-
-YOUR JOB as the agent:
-- Read the error description to see what selector is needed
-- Perform actions in the browser that make that selector appear on the page
-- When the selector appears, the RDP Host will automatically mark the session as successful
-
-Example: If successSelector="text=Agent Success"
-→ Type "Agent Success" in Google's search bar and hit Enter
-→ The text appears on the page → RDP Host detects success!
-========================
 """
 from playwright.sync_api import sync_playwright
 import time
