@@ -223,6 +223,10 @@ When an error occurs, the agent sends:
       "urlContains": "https://example.com/login",
       "titleContains": "Login Page"
     },
+    "detection": {
+      "successSelector": "button:has-text('Login')",
+      "failureSelector": ".error-message"
+    },
     "meta": {
       "runId": "a1b2c3d4",
       "pid": 12345,
@@ -232,6 +236,24 @@ When an error occurs, the agent sends:
   }
 }
 ```
+
+### Detection Selectors
+
+The `detection` object helps the RDP Host autonomously determine if a human operator successfully resolved the issue:
+
+- **`successSelector`**: CSS selector for the element that indicates successful completion. For auto-hooked Playwright errors, this is typically derived from the failing selector (e.g., the button the script was trying to click). The RDP Host watches for this element to appear, confirming the operator completed the task.
+
+- **`failureSelector`** (optional): CSS selector for a known error element (e.g., `.error-message`, `#login-failed-toast`). If this element appears, the RDP Host knows the operator's attempt failed. This field may be omitted when no specific error indicator is known.
+
+For auto-hooked errors, the `successSelector` is automatically extracted from the Playwright method call (e.g., `page.click("button#submit")` → `successSelector: "button#submit"`). When triggering support requests manually via the API, you can provide custom selectors.
+
+**For Human Agents:**
+The error `description` field will include `| successSelector=<value>` so you can immediately see what element needs to appear on the page. Your job is to perform actions in the browser that make that selector become visible/present. Once the RDP Host detects the selector, the session is marked as successful.
+
+Example: If you see `| successSelector=text=Agent Success` in the error description:
+- Type "Agent Success" in a search box and submit
+- The text appears on the page
+- RDP Host detects it and marks the task as complete
 
 ### Browser-Specific Behavior
 

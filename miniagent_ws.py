@@ -220,7 +220,10 @@ class SupportRequestManager:
         url: Optional[str] = None,
         title: Optional[str] = None,
         page_id: Optional[str] = None,
-        resume_endpoint: Optional[Dict[str, Any]] = None
+        resume_endpoint: Optional[Dict[str, Any]] = None,
+        success_selector: Optional[str] = None,
+        failure_selector: Optional[str] = None,
+        cdp_target_id: Optional[str] = None
     ):
         """
         Trigger a support request with deduplication.
@@ -234,6 +237,9 @@ class SupportRequestManager:
             title: Current page title
             page_id: Unique page identifier for deduplication
             resume_endpoint: Optional dict with resume endpoint info (scheme, host, port, path, token)
+            success_selector: Optional CSS selector that indicates successful completion (e.g., element agent was trying to reach)
+            failure_selector: Optional CSS selector that indicates failure (e.g., error message element)
+            cdp_target_id: Optional CDP Target ID for the specific page
         """
         page_id = page_id or "default"
         
@@ -262,6 +268,9 @@ class SupportRequestManager:
         if debug_port is not None:
             control_target["debugPort"] = debug_port
         
+        if cdp_target_id is not None:
+            control_target["targetId"] = cdp_target_id
+        
         if url and not self.redact_urls:
             control_target["urlContains"] = url[:100]  # Truncate long URLs
         
@@ -284,7 +293,20 @@ class SupportRequestManager:
             "meta": meta
         }
         
-        logger.info(f"Triggering support request: {reason}")
+        # Add detection selectors if provided
+        if success_selector is not None or failure_selector is not None:
+            detection = {}
+            if success_selector is not None:
+                detection["successSelector"] = success_selector
+            if failure_selector is not None:
+                detection["failureSelector"] = failure_selector
+            payload["detection"] = detection
+        
+        # Log with targetId if present for verification
+        log_msg = f"Triggering support request: {reason}"
+        if cdp_target_id:
+            log_msg += f" (targetId: {cdp_target_id})"
+        logger.info(log_msg)
         self.ws_client.send_support_request(payload)
 
 

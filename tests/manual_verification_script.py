@@ -63,10 +63,13 @@ def main():
         print("    □ First request has debugPort: 9222")
         print("    □ First request has urlContains: https://www.pixilart.com/")
         print("    □ First request has titleContains: Pixilart...")
+        print("    □ First request has detection.successSelector: canvas.non-existent-element")
         print("    □ Second request has debugPort: 9222")
         print("    □ Second request has urlContains: https://www.pixilart.com/")
         print("    □ Second request has titleContains: Pixilart...")
+        print("    □ Second request has detection.successSelector: button:has-text('NonExistent...')")
         print("    □ Both requests connected to correct CDP tab (not random window)")
+        print("    □ Both requests have detection object for autonomous success/failure detection")
         
         print("\n[6] Keeping browser open for 10 seconds...")
         print("    Verify in Flutter that CDP connected to Pixilart tab both times")
