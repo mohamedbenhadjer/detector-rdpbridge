@@ -20,6 +20,44 @@ Automatically detect Playwright errors and send support requests to your Flutter
 4. Flutter creates a support request with control info for remote assistance
 5. Your test continues or handles the exception based on the configured mode
 
+## Quick Persistent Setup
+
+**Goal:** Set up environment variables once so they work automatically in every new terminal and after system restarts—no need to re-run setup scripts manually.
+
+### Linux/macOS (bash/zsh)
+
+Add this line to your shell profile (`~/.bashrc` or `~/.zshrc`):
+
+```bash
+source /absolute/path/to/detector-rdpbridge/setup_env.sh
+```
+
+Or copy all the `export` lines from `setup_env.sh` directly into your profile. After restarting your terminal (or running `source ~/.bashrc`), the environment will be configured automatically.
+
+### Windows PowerShell
+
+Add this line to your PowerShell profile (`$PROFILE`):
+
+```powershell
+. "C:\absolute\path\to\detector-rdpbridge\setup_env.ps1"
+```
+
+To edit your profile: `notepad $PROFILE` (create it if it doesn't exist). After restarting PowerShell, environment variables will be set automatically.
+
+### Windows CMD
+
+Run the setup script once with the `install` argument to make environment variables permanent:
+
+```cmd
+setup_env.bat install
+```
+
+This uses `setx` to write variables to your user environment. They'll persist across all future CMD sessions and reboots. (Note: You'll need to open a new CMD window after installation for changes to take effect.)
+
+---
+
+**That's it!** Once you've completed the setup for your OS, you never need to run the setup scripts again. Jump to the detailed [Setup](#setup) section below if you need more configuration options.
+
 ## Error Handling Modes
 
 Choose how errors are handled:
@@ -60,11 +98,30 @@ pip install -r requirements.txt
 playwright install
 ```
 
-### 2. Set Environment Variables
+### 2. Set Environment Variables (Persistent Setup - Recommended)
 
-#### Linux (bash/zsh)
+**For the simplest setup, see [Quick Persistent Setup](#quick-persistent-setup) above.**
 
-Add to `~/.bashrc` or `~/.zshrc`:
+These instructions show you how to configure environment variables so they persist across terminal sessions and reboots. Choose the method for your operating system:
+
+#### Linux/macOS (bash/zsh) - Permanent Setup
+
+**Option A: Source the provided script from your shell profile (Recommended)**
+
+Add this single line to `~/.bashrc` or `~/.zshrc`:
+
+```bash
+source /absolute/path/to/detector-rdpbridge/setup_env.sh
+```
+
+Then reload your shell:
+```bash
+source ~/.bashrc  # or source ~/.zshrc
+```
+
+**Option B: Copy environment variables directly to your profile**
+
+Add these lines to `~/.bashrc` or `~/.zshrc`:
 
 ```bash
 # MiniAgent configuration
@@ -90,13 +147,32 @@ Then reload:
 source ~/.bashrc
 ```
 
-#### Windows (PowerShell)
+**After setup:** Environment variables will be automatically available in every new terminal session.
 
-Add to your PowerShell profile (`$PROFILE`):
+#### Windows (PowerShell) - Permanent Setup
+
+**Option A: Source the provided script from your PowerShell profile (Recommended)**
+
+1. Open your PowerShell profile for editing:
+   ```powershell
+   notepad $PROFILE
+   ```
+   (If the file doesn't exist, create it when prompted)
+
+2. Add this line to your profile:
+   ```powershell
+   . "C:\absolute\path\to\detector-rdpbridge\setup_env.ps1"
+   ```
+
+3. Save and restart PowerShell.
+
+**Option B: Copy environment variables directly to your profile**
+
+Add these lines to your PowerShell profile (`$PROFILE`):
 
 ```powershell
 # MiniAgent configuration
-$env:PYTHONPATH = "E:\detector-rdpbridge;$env:PYTHONPATH"
+$env:PYTHONPATH = "C:\path\to\detector-rdpbridge;$env:PYTHONPATH"
 $env:MINIAGENT_ENABLED = "1"
 $env:MINIAGENT_WS_URL = "ws://127.0.0.1:8777/ws"
 $env:MINIAGENT_TOKEN = "change-me"
@@ -111,31 +187,49 @@ $env:MINIAGENT_RESUME_FILE = "$env:TEMP\miniagent_resume"
 $env:MINIAGENT_HOLD_SECS = "3600"
 ```
 
-Or set system/user environment variables via System Properties → Advanced → Environment Variables.
+**Option C: Set system/user environment variables via GUI**
 
-#### Windows (CMD)
+Set permanent environment variables via System Properties → Advanced → Environment Variables. This survives reboots but requires manual entry of each variable.
 
-Create a batch file to set variables before running tests:
+**After setup:** Environment variables will be automatically available in every new PowerShell session.
 
-```batch
-@echo off
-set PYTHONPATH=E:\detector-rdpbridge;%PYTHONPATH%
-set MINIAGENT_ENABLED=1
-set MINIAGENT_WS_URL=ws://127.0.0.1:8777/ws
-set MINIAGENT_TOKEN=change-me
-set MINIAGENT_CLIENT=python-cdp-monitor
-set MINIAGENT_COOLDOWN_SEC=0
-set MINIAGENT_DEBUG_PORT=9222
-set MINIAGENT_FORCE_DEBUG_PORT=1
-set MINIAGENT_ON_ERROR=hold
-set MINIAGENT_RESUME_HTTP=1
-set MINIAGENT_RESUME_HTTP_TOKEN=change-me
-set MINIAGENT_RESUME_FILE=%TEMP%\miniagent_resume
-set MINIAGENT_HOLD_SECS=3600
+#### Windows (CMD) - Permanent Setup
 
-REM Run your test
-python my_playwright.py
+**Option A: Use the provided script with install mode (Recommended)**
+
+Run once to permanently set environment variables for your user account:
+
+```cmd
+setup_env.bat install
 ```
+
+After running, close and reopen CMD windows. Variables will persist across all future CMD sessions and reboots.
+
+**Option B: Manually use setx for permanent variables**
+
+Run these commands once (note: requires opening a new CMD window after to see changes):
+
+```cmd
+setx PYTHONPATH "C:\path\to\detector-rdpbridge;%PYTHONPATH%"
+setx MINIAGENT_ENABLED "1"
+setx MINIAGENT_WS_URL "ws://127.0.0.1:8777/ws"
+setx MINIAGENT_TOKEN "your-token-here"
+setx MINIAGENT_CLIENT "python-cdp-monitor"
+setx MINIAGENT_COOLDOWN_SEC "0"
+setx MINIAGENT_DEBUG_PORT "9222"
+setx MINIAGENT_FORCE_DEBUG_PORT "1"
+setx MINIAGENT_ON_ERROR "hold"
+setx MINIAGENT_RESUME_HTTP "1"
+setx MINIAGENT_RESUME_HTTP_TOKEN "your-token-here"
+setx MINIAGENT_RESUME_FILE "%TEMP%\miniagent_resume"
+setx MINIAGENT_HOLD_SECS "3600"
+```
+
+**Option C: Temporary setup (per-session only)**
+
+If you prefer to set variables only for the current CMD session (not persistent), you can use `setup_env.bat` without arguments or use `set` commands instead of `setx`.
+
+**After setup:** Environment variables will be automatically available in every new CMD session.
 
 ### 3. Get Your Shared Token
 
@@ -145,9 +239,13 @@ You can find or generate it in your Flutter app configuration.
 
 ### 4. Run Your Tests (No Changes!)
 
+Once you've completed the persistent setup above, simply run your Playwright tests as normal:
+
 ```bash
 python my_playwright.py
 ```
+
+**No need to run setup scripts or set environment variables manually—they're already configured!**
 
 The hook will automatically:
 - Intercept errors
