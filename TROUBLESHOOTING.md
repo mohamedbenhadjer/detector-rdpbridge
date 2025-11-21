@@ -2,6 +2,8 @@
 
 Common issues and solutions for MiniAgent.
 
+> **💡 Tip:** Most environment-related issues can be avoided by using [persistent setup](README.md#quick-persistent-setup). This configures environment variables once so they're automatically available in every terminal session and after reboots—no need to manually run setup scripts!
+
 ## Table of Contents
 - [Setup Issues](#setup-issues)
 - [Connection Issues](#connection-issues)
@@ -48,6 +50,10 @@ playwright install
 **Cause**: PYTHONPATH doesn't include the project directory
 
 **Solution**:
+
+For permanent setup (recommended), see the [Quick Persistent Setup](README.md#quick-persistent-setup) section in README.
+
+For temporary setup (current session only):
 
 Linux/Mac:
 ```bash
@@ -119,9 +125,19 @@ Should include `/home/mohamed/detector-rdpbridge`.
 **Solution**:
 1. Check Flutter app configuration for the shared token
 2. Set matching token in Python:
+   
+   **If using persistent setup (recommended):**
+   - Edit your shell profile (`~/.bashrc`, `~/.zshrc`, or `$PROFILE`) or `setup_env.sh`/`setup_env.ps1` file
+   - Change `MINIAGENT_TOKEN="change-me"` to `MINIAGENT_TOKEN="exact-token-from-flutter"`
+   - Restart your terminal or run `source ~/.bashrc`
+   
+   **For temporary testing:**
    ```bash
-   export MINIAGENT_TOKEN="exact-token-from-flutter"
+   export MINIAGENT_TOKEN="exact-token-from-flutter"  # Linux/Mac
+   $env:MINIAGENT_TOKEN="exact-token-from-flutter"    # PowerShell
+   set MINIAGENT_TOKEN=exact-token-from-flutter       # CMD
    ```
+
 3. Restart your Playwright script
 
 ---
@@ -438,15 +454,19 @@ browser = p.chromium.launch(headless=True)
 
 **Cause**: Environment variable not saved system-wide
 
-**Solution (Permanent)**:
-1. Open System Properties → Advanced → Environment Variables
-2. Add User variable:
-   - Name: `PYTHONPATH`
-   - Value: `C:\Users\YourUser\detector-rdpbridge;%PYTHONPATH%`
-3. Restart terminal
+**Solution (Permanent - Recommended)**:
 
-**Solution (Per-session)**:
-Use `setup_env.bat` before running scripts
+See the [Quick Persistent Setup](README.md#quick-persistent-setup) section in README for complete instructions.
+
+Quick options:
+- **PowerShell**: Add `. "C:\path\to\setup_env.ps1"` to your `$PROFILE`
+- **CMD**: Run `setup_env.bat install` once
+- **Manual GUI**: Open System Properties → Advanced → Environment Variables, then add User variable `PYTHONPATH` with value `C:\Users\YourUser\detector-rdpbridge;%PYTHONPATH%`
+
+After permanent setup, restart your terminal. Environment will be configured automatically in all future sessions.
+
+**Solution (Per-session - Temporary)**:
+Run `setup_env.bat` (without arguments) before running scripts in each new CMD window
 
 ---
 
@@ -565,7 +585,8 @@ If all else fails:
 ### Common Gotchas
 
 - ❌ Forgetting to set `MINIAGENT_TOKEN`
-- ❌ PYTHONPATH set in one terminal but running in another
+- ❌ Not using persistent setup: manually running setup scripts every time instead of adding to shell profile (see [Quick Persistent Setup](README.md#quick-persistent-setup))
+- ❌ PYTHONPATH set in one terminal but running in another (use persistent setup to avoid this)
 - ❌ Virtual environment: forgetting to activate before setting env vars
 - ❌ Expecting immediate retries (cooldown active)
 - ❌ Flutter app not running

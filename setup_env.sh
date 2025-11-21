@@ -1,6 +1,20 @@
 #!/bin/bash
 # Setup script for Linux/Mac
-# Source this file or add contents to your ~/.bashrc or ~/.zshrc
+#
+# USAGE:
+#
+# 1. Ad-hoc (temporary, current terminal only):
+#    source setup_env.sh
+#
+# 2. Persistent (automatic for all terminals):
+#    Add this line to your ~/.bashrc or ~/.zshrc:
+#      source /absolute/path/to/detector-rdpbridge/setup_env.sh
+#
+#    Or run this command once to append it automatically:
+#      echo "source $(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/setup_env.sh" >> ~/.bashrc
+#      source ~/.bashrc
+#
+# After persistent setup, you never need to run this script manually again!
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 

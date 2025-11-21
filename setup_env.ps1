@@ -1,6 +1,23 @@
 # Setup script for Windows PowerShell
-# Run this before executing Playwright tests: . .\setup_env.ps1
-# The dot (.) at the beginning sources the script in the current session
+#
+# USAGE:
+#
+# 1. Ad-hoc (temporary, current session only):
+#    . .\setup_env.ps1
+#    (The dot at the beginning sources the script in the current session)
+#
+# 2. Persistent (automatic for all PowerShell sessions):
+#    Add this line to your PowerShell profile ($PROFILE):
+#      . "C:\absolute\path\to\detector-rdpbridge\setup_env.ps1"
+#
+#    To edit your profile:
+#      notepad $PROFILE
+#    (Create the file if it doesn't exist)
+#
+#    Or run this command once to append it automatically:
+#      Add-Content $PROFILE ". `"$PSScriptRoot\setup_env.ps1`""
+#
+# After persistent setup, you never need to run this script manually again!
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
