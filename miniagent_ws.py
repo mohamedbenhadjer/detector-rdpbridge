@@ -276,7 +276,7 @@ class SupportRequestManager:
         
         if title and not self.redact_urls:
             control_target["titleContains"] = title[:100]
-        
+            
         if resume_endpoint is not None:
             control_target["resumeEndpoint"] = resume_endpoint
         
@@ -301,7 +301,7 @@ class SupportRequestManager:
             if failure_selector is not None:
                 detection["failureSelector"] = failure_selector
             payload["detection"] = detection
-        
+            
         # Log with targetId if present for verification
         log_msg = f"Triggering support request: {reason}"
         if cdp_target_id:
