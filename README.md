@@ -4,17 +4,14 @@ Automatically detect Playwright errors and send support requests to your Flutter
 
 ## Features
 
-- ✅ **Zero code changes** to your Playwright tests
-- ✅ Catches timeouts, selector errors, actionability failures, navigation errors, assertions
-- ✅ Keeps browser and process running after errors
-- ✅ Auto-enables remote debugging for Chromium with dynamic port allocation (allows agent control via CDP)
-- ✅ Automatic CDP target ID resolution for precise tab targeting (multi-window support)
-- ✅ Auto-extracts detection selectors (`successSelector`, `failureSelector`) for autonomous completion detection
-- ✅ Popup/new-tab prevention with regex allowlist (keeps agent focused on single tab)
-- ✅ HTTP resume endpoint with per-process isolation for programmatic script resumption
-- ✅ Cross-browser: Chromium, Firefox, WebKit (sync and async Playwright)
-- ✅ Cross-platform: Linux, macOS, and Windows
-- ✅ Deduplication and cooldown to avoid spam
+- ✅ **Explicit Agent Handoff**: Triggers support requests specifically when `NeedsAgentInterventionError` is raised
+- ✅ **Automatic Context Capture**: Captures full browser state (CDP target, debug port, URL) even for manually raised errors
+- ✅ **Global Selector Tracking**: Automatically inherits selectors from the last failed Playwright action
+- ✅ **Hold & Fix**: Keeps browser open and pauses script execution for agent intervention
+- ✅ **Auto-Resume**: Resumes script execution automatically after agent fixes the issue
+- ✅ **Zero Config CDP**: Auto-enables remote debugging for Chromium with dynamic port allocation
+- ✅ **Popup Prevention**: Keeps agent focused on a single tab by preventing new windows
+- ✅ **Cross-Platform**: Works on Linux, macOS, and Windows
 
 ## How It Works
 
@@ -22,7 +19,7 @@ Automatically detect Playwright errors and send support requests to your Flutter
 2. The hook monkey-patches Playwright APIs (`Page`, `Locator`, `Browser`, `BrowserContext`) to intercept exceptions and inject CDP/popup-prevention settings
 3. For Chromium browsers, automatically injects `--remote-debugging-port` with dynamic port allocation
 4. Installs popup/new-tab prevention on all browser contexts and pages (can be disabled)
-5. On error, extracts page context, CDP target ID, and detection selectors from the failing method
+5. On `NeedsAgentInterventionError`, extracts page context, CDP target ID, and inherits detection selectors from the last failure
 6. Sends a WebSocket message to your Flutter app at `ws://127.0.0.1:8777/ws` with full control metadata
 7. Flutter creates a support request with `controlTarget` (browser, debugPort, targetId, URL) and `detection` (successSelector, failureSelector)
 8. Optionally starts HTTP resume endpoint for programmatic script resumption
@@ -470,13 +467,18 @@ Example: If you see `| successSelector=text=Agent Success` in the error descript
 
 ## Detected Errors
 
-The hook catches:
+The hook specifically listens for:
+- ✅ `NeedsAgentInterventionError`
 
-- ✅ `TimeoutError` - element not found, wait timeout
-- ✅ `Error` - Playwright API errors, actionability failures
-- ✅ `AssertionError` - failed expect() assertions
-- ✅ Navigation timeouts and failures
-- ✅ Selector errors (element not visible, not enabled, etc.)
+This error can be raised manually in your script when you determine that human/agent assistance is required (e.g., after catching a `TimeoutError` or detecting a CAPTCHA).
+
+**Automatic Context Inheritance:**
+When you raise `NeedsAgentInterventionError`, the hook automatically:
+1.  Resolves the last active page and browser context
+2.  Retrieves the CDP Target ID and Debug Port
+3.  **Inherits the selectors** from the last failed Playwright method call (if any)
+
+This means if you catch a `TimeoutError` on `page.click("#btn")` and immediately raise `NeedsAgentInterventionError`, the support request will correctly include `#btn` as the `successSelector`.
 
 **Note:** Both `Page` method errors (e.g., `page.click()`) and `Locator` method errors (e.g., `page.locator().click()`) include full CDP criteria (`debugPort`, `targetId`, `urlContains`, `titleContains`) for accurate tab targeting. The hook automatically resolves the page object from Locator instances to extract browser context and CDP information.
 
@@ -575,6 +577,9 @@ with sync_playwright() as p:
         page.click("button:has-text('NonExistentButton')", timeout=5000)
     except Exception as e:
         print(f"Caught error: {e}")
+        # Escalate to agent intervention
+        # The hook will automatically attach the failing selector from the click() call!
+        raise NeedsAgentInterventionError("Button not found, please help!")
     
     print("Test continues after error!")
     input("Press Enter to close browser...")
