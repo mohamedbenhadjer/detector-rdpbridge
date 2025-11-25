@@ -20,6 +20,15 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 if os.environ.get("MINIAGENT_ENABLED", "1") != "1":
     sys.exit(0)
 
+# Define specific error for agent intervention
+class NeedsAgentInterventionError(Exception):
+    """Error raised when a Playwright script needs human/agent intervention."""
+    pass
+
+# Inject into builtins so it's available globally without import
+import builtins
+builtins.NeedsAgentInterventionError = NeedsAgentInterventionError
+
 logger = logging.getLogger("miniagent.hook")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
@@ -565,6 +574,77 @@ def _intercept_playwright():
         logger.error(f"Failed to import miniagent_ws: {e}")
         return
     
+    # Patch Browser context manager to catch NeedsAgentInterventionError
+    try:
+        from playwright.sync_api import Browser as SyncBrowser
+        _orig_browser_close = SyncBrowser.close
+        
+        def _patched_browser_close(self):
+            """Patched close to handle any pending operations."""
+            return _orig_browser_close(self)
+        
+        SyncBrowser.close = _patched_browser_close
+        
+        # Patch Playwright's context manager __exit__
+        try:
+            # Try to import the actual context manager class
+            from playwright.sync_api._context_manager import PlaywrightContextManager
+            _orig_playwright_exit = PlaywrightContextManager.__exit__
+            
+            def _patched_playwright_exit(self, exc_type, exc_val, exc_tb):
+                """Intercept NeedsAgentInterventionError before exiting context."""
+                if exc_type and issubclass(exc_type, NeedsAgentInterventionError):
+                    # Handle the error here before closing browsers
+                    if not getattr(exc_val, "_miniagent_handled", False):
+                        logger.info(f"Caught NeedsAgentInterventionError in Playwright context: {exc_val}")
+                        
+                        # Get context from last active page
+                        ctx = _get_support_context()
+                        
+                        # Use last failure selectors if available
+                        global _last_failure_selectors
+                        success_selector, failure_selector = _last_failure_selectors
+                        
+                        # Trigger support request
+                        manager.trigger_support_request(
+                            reason=exc_type.__name__,
+                            details=str(exc_val),
+                            browser=ctx["browser"],
+                            debug_port=ctx["debug_port"],
+                            url=ctx["url"],
+                            title=ctx["title"],
+                            page_id=ctx["page_id"],
+                            resume_endpoint=ctx["resume_endpoint"],
+                            success_selector=success_selector,
+                            failure_selector=failure_selector,
+                            cdp_target_id=ctx["cdp_target_id"]
+                        )
+                        
+                        # Hold if needed (browser stays open during hold)
+                        if _MODE == "hold":
+                            logger.warning(f"Holding on error - browser will stay open. Resume file: {_RESUME_FILE}")
+                            _park_until_resume(exc_type.__name__, str(exc_val))
+                            # After resume, suppress the exception and continue
+                            return True  # Suppress exception
+                        elif _MODE == "swallow":
+                            return True  # Suppress exception
+                        # For report mode, suppress exception too
+                        return True
+                
+                # For all other exceptions, use original behavior
+                return _orig_playwright_exit(self, exc_type, exc_val, exc_tb)
+            
+            PlaywrightContextManager.__exit__ = _patched_playwright_exit
+            logger.debug("Patched PlaywrightContextManager for NeedsAgentInterventionError")
+        except ImportError:
+            # Fallback: try patching via sync_api if exposed (unlikely for _context_manager)
+            logger.debug("Could not import PlaywrightContextManager directly")
+        except Exception as e:
+            logger.debug(f"Could not patch Playwright context manager: {e}")
+            
+    except ImportError:
+        logger.debug("Could not import Browser for context manager patching")
+    
     # Track browser info per launch
     _browser_info: Dict[int, Dict[str, Any]] = {}
     
@@ -808,6 +888,76 @@ def _intercept_playwright():
     
     # === Error interception ===
     
+    # Track last active page to provide context for global errors
+    import weakref
+    global _last_active_page_ref
+    _last_active_page_ref = None
+    
+    # Track last failure selectors to provide context when NeedsAgentInterventionError is raised manually
+    global _last_failure_selectors
+    _last_failure_selectors = (None, None)
+    
+    def _get_support_context(page_obj=None) -> Dict[str, Any]:
+        """
+        Get context for support request (browser, page info, CDP target, etc.).
+        Uses provided page_obj or falls back to last active page.
+        """
+        global _last_active_page_ref
+        
+        # Resolve page object
+        if not page_obj and _last_active_page_ref:
+            try:
+                page_obj = _last_active_page_ref()
+            except:
+                pass
+        
+        # Extract page info
+        page_info = _get_page_info(page_obj) if page_obj else {}
+        
+        # Get browser info
+        browser_info = {"browser": "chromium", "debug_port": None}
+        try:
+            if page_obj and hasattr(page_obj, "context"):
+                ctx = page_obj.context
+                # Try via Browser → mapping
+                if hasattr(ctx, "browser") and ctx.browser and id(ctx.browser) in _browser_info:
+                    browser_info = _browser_info[id(ctx.browser)]
+                # Persistent context path stores mapping by context id
+                elif id(ctx) in _browser_info:
+                    browser_info = _browser_info[id(ctx)]
+            # Fallback: detect browser type off the object if needed
+            elif page_obj and hasattr(page_obj, "_impl") and hasattr(page_obj._impl, "_browser_type"):
+                bt_name = page_obj._impl._browser_type.name
+                browser_info["browser"] = bt_name if bt_name in ("firefox", "webkit") else "chromium"
+        except Exception:
+            pass
+        
+        # Try to resolve CDP Target ID for Chromium browsers
+        cdp_target_id = None
+        if browser_info.get("debug_port") and page_info.get("url"):
+            cdp_target_id = _get_cdp_target_id(browser_info["debug_port"], page_info["url"])
+        
+        # Build resume endpoint info if HTTP resume is enabled
+        resume_endpoint = None
+        if _RESUME_HTTP_ENABLED and _RESUME_HTTP_TOKEN:
+            resume_endpoint = {
+                "scheme": "http",
+                "host": _RESUME_HTTP_HOST,
+                "port": _RESUME_HTTP_PORT,
+                "path": "/resume",
+                "token": _RESUME_HTTP_TOKEN
+            }
+            
+        return {
+            "browser": browser_info["browser"],
+            "debug_port": browser_info.get("debug_port"),
+            "url": page_info.get("url"),
+            "title": page_info.get("title"),
+            "page_id": page_info.get("page_id"),
+            "resume_endpoint": resume_endpoint,
+            "cdp_target_id": cdp_target_id
+        }
+    
     def _wrap_method(cls, method_name: str, is_async: bool = False):
         """Wrap a method to catch and report Playwright exceptions."""
         orig_method = getattr(cls, method_name)
@@ -832,52 +982,36 @@ def _intercept_playwright():
         
         def _sync_wrapper(self, *args, **kwargs):
             try:
-                return orig_method(self, *args, **kwargs)
-            except (PlaywrightTimeoutError, PlaywrightError, AssertionError) as e:
                 # Resolve page object from Page or Locator
                 page_obj = _resolve_page_obj(self)
-                page_info = _get_page_info(page_obj) if page_obj else {}
                 
-                # Get browser info from resolved page
-                browser_info = {"browser": "chromium", "debug_port": None}
-                try:
-                    if page_obj and hasattr(page_obj, "context"):
-                        ctx = page_obj.context
-                        # Try via Browser → mapping
-                        if hasattr(ctx, "browser") and ctx.browser and id(ctx.browser) in _browser_info:
-                            browser_info = _browser_info[id(ctx.browser)]
-                        # Persistent context path stores mapping by context id
-                        elif id(ctx) in _browser_info:
-                            browser_info = _browser_info[id(ctx)]
-                    # Fallback: detect browser type off the object if needed
-                    elif hasattr(self, "_impl") and hasattr(self._impl, "_browser_type"):
-                        bt_name = self._impl._browser_type.name
-                        browser_info["browser"] = bt_name if bt_name in ("firefox", "webkit") else "chromium"
-                except Exception:
-                    pass
+                # Update last active page
+                if page_obj:
+                    global _last_active_page_ref
+                    try:
+                        _last_active_page_ref = weakref.ref(page_obj)
+                    except:
+                        pass
+                
+                return orig_method(self, *args, **kwargs)
+            except (PlaywrightTimeoutError, PlaywrightError, AssertionError, NeedsAgentInterventionError) as e:
+                # Resolve page object again (in case it wasn't resolved before)
+                page_obj = _resolve_page_obj(self)
+                
+                # Get context using helper
+                ctx = _get_support_context(page_obj)
                 
                 # Determine error type
                 error_type = type(e).__name__
                 error_msg = str(e)[:200]
                 
-                # Try to resolve CDP Target ID for Chromium browsers
-                cdp_target_id = None
-                if browser_info.get("debug_port") and page_info.get("url"):
-                    cdp_target_id = _get_cdp_target_id(browser_info["debug_port"], page_info["url"])
-                
-                # Build resume endpoint info if HTTP resume is enabled
-                resume_endpoint = None
-                if _RESUME_HTTP_ENABLED and _RESUME_HTTP_TOKEN:
-                    resume_endpoint = {
-                        "scheme": "http",
-                        "host": _RESUME_HTTP_HOST,
-                        "port": _RESUME_HTTP_PORT,
-                        "path": "/resume",
-                        "token": _RESUME_HTTP_TOKEN
-                    }
-                
                 # Extract detection selectors
                 success_selector, failure_selector = _extract_detection_selectors(method_name, self, args, kwargs)
+                
+                # Store selectors for global error handling (in case user catches this and raises NeedsAgentInterventionError)
+                if success_selector or failure_selector:
+                    global _last_failure_selectors
+                    _last_failure_selectors = (success_selector, failure_selector)
                 
                 # Build details string including selectors for human readability
                 details = f"{method_name}: {error_msg}"
@@ -887,76 +1021,68 @@ def _intercept_playwright():
                     details += f" | failureSelector={failure_selector}"
                 
                 # Trigger support request
-                manager.trigger_support_request(
-                    reason=error_type,
-                    details=details,
-                    browser=browser_info["browser"],
-                    debug_port=browser_info.get("debug_port"),
-                    url=page_info.get("url"),
-                    title=page_info.get("title"),
-                    page_id=page_info.get("page_id"),
-                    resume_endpoint=resume_endpoint,
-                    success_selector=success_selector,
-                    failure_selector=failure_selector,
-                    cdp_target_id=cdp_target_id
-                )
+                if isinstance(e, NeedsAgentInterventionError):
+                    manager.trigger_support_request(
+                        reason=error_type,
+                        details=details,
+                        browser=ctx["browser"],
+                        debug_port=ctx["debug_port"],
+                        url=ctx["url"],
+                        title=ctx["title"],
+                        page_id=ctx["page_id"],
+                        resume_endpoint=ctx["resume_endpoint"],
+                        success_selector=success_selector,
+                        failure_selector=failure_selector,
+                        cdp_target_id=ctx["cdp_target_id"]
+                    )
+                    # Mark as handled so global hook doesn't re-trigger
+                    e._miniagent_handled = True
+                    
+                    # Handle based on mode (only for NeedsAgentInterventionError)
+                    if _MODE == "hold":
+                        _park_until_resume(error_type, error_msg)
+                        # DON'T re-raise - return None to continue (keeps browser open)
+                        return None
+                    if _MODE == "swallow":
+                        # DON'T re-raise - return None to continue
+                        return None
+                    # For report mode: DON'T re-raise, just return None
+                    return None
                 
-                # Handle based on mode
-                if _MODE == "hold":
-                    _park_until_resume(error_type, error_msg)
-                    return None
-                if _MODE == "swallow":
-                    return None
-                # Default: re-raise the exception
+                # For other errors (not NeedsAgentInterventionError), always re-raise
                 raise
         
         async def _async_wrapper(self, *args, **kwargs):
             try:
-                return await orig_method(self, *args, **kwargs)
-            except (PlaywrightTimeoutError, PlaywrightError, AssertionError) as e:
                 # Resolve page object from Page or Locator
                 page_obj = _resolve_page_obj(self)
-                page_info = _get_page_info(page_obj) if page_obj else {}
                 
-                # Get browser info from resolved page
-                browser_info = {"browser": "chromium", "debug_port": None}
-                try:
-                    if page_obj and hasattr(page_obj, "context"):
-                        ctx = page_obj.context
-                        # Try via Browser → mapping
-                        if hasattr(ctx, "browser") and ctx.browser and id(ctx.browser) in _browser_info:
-                            browser_info = _browser_info[id(ctx.browser)]
-                        # Persistent context path stores mapping by context id
-                        elif id(ctx) in _browser_info:
-                            browser_info = _browser_info[id(ctx)]
-                    # Fallback: detect browser type off the object if needed
-                    elif hasattr(self, "_impl") and hasattr(self._impl, "_browser_type"):
-                        bt_name = self._impl._browser_type.name
-                        browser_info["browser"] = bt_name if bt_name in ("firefox", "webkit") else "chromium"
-                except Exception:
-                    pass
+                # Update last active page
+                if page_obj:
+                    global _last_active_page_ref
+                    try:
+                        _last_active_page_ref = weakref.ref(page_obj)
+                    except:
+                        pass
+
+                return await orig_method(self, *args, **kwargs)
+            except (PlaywrightTimeoutError, PlaywrightError, AssertionError, NeedsAgentInterventionError) as e:
+                # Resolve page object again
+                page_obj = _resolve_page_obj(self)
+                
+                # Get context using helper
+                ctx = _get_support_context(page_obj)
                 
                 error_type = type(e).__name__
                 error_msg = str(e)[:200]
                 
-                # Try to resolve CDP Target ID for Chromium browsers
-                cdp_target_id = None
-                if browser_info.get("debug_port") and page_info.get("url"):
-                    cdp_target_id = _get_cdp_target_id(browser_info["debug_port"], page_info["url"])
-                
-                # Build resume endpoint info if HTTP resume is enabled
-                resume_endpoint = None
-                if _RESUME_HTTP_ENABLED and _RESUME_HTTP_TOKEN:
-                    resume_endpoint = {
-                        "scheme": "http",
-                        "host": _RESUME_HTTP_HOST,
-                        "port": _RESUME_HTTP_PORT,
-                        "path": "/resume",
-                        "token": _RESUME_HTTP_TOKEN
-                    }
-                
                 # Extract detection selectors
                 success_selector, failure_selector = _extract_detection_selectors(method_name, self, args, kwargs)
+                
+                # Store selectors for global error handling (in case user catches this and raises NeedsAgentInterventionError)
+                if success_selector or failure_selector:
+                    global _last_failure_selectors
+                    _last_failure_selectors = (success_selector, failure_selector)
                 
                 # Build details string including selectors for human readability
                 details = f"{method_name}: {error_msg}"
@@ -965,44 +1091,50 @@ def _intercept_playwright():
                 if failure_selector:
                     details += f" | failureSelector={failure_selector}"
                 
-                manager.trigger_support_request(
-                    reason=error_type,
-                    details=details,
-                    browser=browser_info["browser"],
-                    debug_port=browser_info.get("debug_port"),
-                    url=page_info.get("url"),
-                    title=page_info.get("title"),
-                    page_id=page_info.get("page_id"),
-                    resume_endpoint=resume_endpoint,
-                    success_selector=success_selector,
-                    failure_selector=failure_selector,
-                    cdp_target_id=cdp_target_id
-                )
-                
-                # Handle based on mode
-                if _MODE == "hold":
-                    # Async park until resume/timeout
-                    logger.warning(f"Holding on error ({error_type}) - waiting for agent. Resume file: {_RESUME_FILE}")
-                    deadline = _hold_deadline()
-                    while True:
-                        try:
-                            if _RESUME_FILE and Path(_RESUME_FILE).exists():
-                                logger.info("Resume signal detected; continuing.")
-                                try:
-                                    Path(_RESUME_FILE).unlink(missing_ok=True)
-                                except Exception:
-                                    pass
+                if isinstance(e, NeedsAgentInterventionError):
+                    manager.trigger_support_request(
+                        reason=error_type,
+                        details=details,
+                        browser=ctx["browser"],
+                        debug_port=ctx["debug_port"],
+                        url=ctx["url"],
+                        title=ctx["title"],
+                        page_id=ctx["page_id"],
+                        resume_endpoint=ctx["resume_endpoint"],
+                        success_selector=success_selector,
+                        failure_selector=failure_selector,
+                        cdp_target_id=ctx["cdp_target_id"]
+                    )
+                    # Mark as handled so global hook doesn't re-trigger
+                    e._miniagent_handled = True
+                    
+                    # Handle based on mode (only for NeedsAgentInterventionError)
+                    if _MODE == "hold":
+                        # Async park until resume/timeout
+                        logger.warning(f"Holding on error ({error_type}) - waiting for agent. Resume file: {_RESUME_FILE}")
+                        deadline = _hold_deadline()
+                        while True:
+                            try:
+                                if _RESUME_FILE and Path(_RESUME_FILE).exists():
+                                    logger.info("Resume signal detected; continuing.")
+                                    try:
+                                        Path(_RESUME_FILE).unlink(missing_ok=True)
+                                    except Exception:
+                                        pass
+                                    return None
+                            except Exception:
+                                pass
+                            if deadline and time.time() >= deadline:
+                                logger.info("Hold timeout reached; continuing.")
                                 return None
-                        except Exception:
-                            pass
-                        if deadline and time.time() >= deadline:
-                            logger.info("Hold timeout reached; continuing.")
-                            return None
-                        await asyncio.sleep(1.0)
-                
-                if _MODE == "swallow":
+                            await asyncio.sleep(1.0)
+                    
+                    if _MODE == "swallow":
+                        return None
+                    # For report mode: DON'T re-raise, just return None
                     return None
-                # Default: re-raise the exception
+                
+                # For other errors (not NeedsAgentInterventionError), always re-raise
                 raise
         
         wrapper = _async_wrapper if is_async else _sync_wrapper
@@ -1066,3 +1198,50 @@ try:
     _start_resume_http_server()
 except Exception as e:
     logger.error(f"Failed to start resume HTTP server: {e}")
+
+def _handle_exception(exc_type, exc_value, exc_traceback):
+    """Global exception hook to catch NeedsAgentInterventionError."""
+    
+    if issubclass(exc_type, NeedsAgentInterventionError) and not getattr(exc_value, "_miniagent_handled", False):
+        try:
+            from miniagent_ws import get_support_manager
+            manager = get_support_manager()
+            if manager:
+                # Get context from last active page
+                ctx = _get_support_context()
+                
+                # Use last failure selectors if available
+                global _last_failure_selectors
+                success_selector, failure_selector = _last_failure_selectors
+                
+                manager.trigger_support_request(
+                    reason=exc_type.__name__,
+                    details=str(exc_value),
+                    browser=ctx["browser"],
+                    debug_port=ctx["debug_port"],
+                    url=ctx["url"],
+                    title=ctx["title"],
+                    page_id=ctx["page_id"],
+                    resume_endpoint=ctx["resume_endpoint"],
+                    success_selector=success_selector,
+                    failure_selector=failure_selector,
+                    cdp_target_id=ctx["cdp_target_id"]
+                )
+                
+                # Handle based on mode (hold/swallow for NeedsAgentInterventionError)
+                if _MODE == "hold":
+                    _park_until_resume(exc_type.__name__, str(exc_value))
+                    # Don't call original excepthook - we handled it
+                    return
+                if _MODE == "swallow":
+                    # Don't call original excepthook - suppress the error
+                    return
+        except Exception as e:
+            # Don't let our hook crash the app
+            logger.error(f"Exception in global hook: {e}")
+            pass
+    
+    # For all other cases, call the original excepthook (prints traceback and exits)
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+sys.excepthook = _handle_exception

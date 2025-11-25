@@ -34,17 +34,14 @@ def print_completion_banner():
     print("\n")
 
 def google_search_test():
-    """Test script that opens Google and fails looking for phone field."""
+    """Test script that demonstrates when support requests are triggered."""
     print("=" * 70)
-    print("   GOOGLE.COM TEST - MiniAgent Hook Demonstration")
+    print("   DUCKDUCKGO.COM TEST - NeedsAgentInterventionError Demo")
     print("=" * 70)
     print()
-    print("This script will:")
-    print("  • Open Google.com")
-    print("  • Wait for 'Agent Success' (which isn't there yet)")
-    print("  • Trigger the MiniAgent support request")
-    print("  • YOU (the Agent) will search for 'Agent Success'")
-    print("  • The script will detect success!")
+    print("This script will demonstrate two scenarios:")
+    print("  1. Normal timeout (phone field) - NO support request")
+    print("  2. Agent intervention needed - WILL send support request")
     print()
     print("-" * 70)
     print()
@@ -65,8 +62,8 @@ def google_search_test():
         print("   ✓ Browser launched successfully")
         print()
         
-        # Navigate to Google
-        print("STEP 2: Navigating to Google.com...")
+        # Navigate to DuckDuckGo
+        print("STEP 2: Navigating to DuckDuckGo...")
         page.goto("https://duckduckgo.com")
         print(f"   ✓ Current URL: {page.url}")
         print(f"   ✓ Page Title: {page.title()}")
@@ -74,37 +71,35 @@ def google_search_test():
         
         time.sleep(1)
         
-        # Purposely fail - wait for "Agent Success" text
-        print("STEP 3: Waiting for 'Agent Success' text...")
-        print("   (This text doesn't exist yet - will trigger agent request)")
-        print("   ACTION REQUIRED: When the browser opens, type 'Agent Success' in Google and search!")
+        # SCENARIO 1: Normal timeout - NO support request
+        print("SCENARIO 1: Looking for non-existent phone number field...")
+        print("   (This will timeout but NOT trigger a support request)")
         try:
-            # Try to find text that isn't there yet
-            # The Agent (you) must type this into the search bar to make it appear
-            page.wait_for_selector("text=Agent Success", timeout=5000)
-            print("   ✓ 'Agent Success' found! (Detection worked!)")
+            page.fill("input[name='phone']", "555-1234", timeout=3000)
+            print("   ✓ Phone field found!")
         except Exception as e:
-            print(f"   ✗ Error caught: {type(e).__name__}")
-            print(f"   ✗ Message: {str(e)[:100]}...")
-            print(f"   → MiniAgent support request sent automatically!")
-            print(f"   → RDP Host is now watching for: 'text=Agent Success'")
+            print(f"   ✗ Timeout: {type(e).__name__}")
+            print(f"   ✓ NO support request sent (as expected)")
             print()
         
         time.sleep(2)
         
-        # Show that browser is still running
-        print("STEP 4: Verifying browser state...")
-        print("   ✓ Browser is still running")
-        print("   ✓ Page is still accessible")
-        print(f"   ✓ Current URL: {page.url}")
-        print()
+        # SCENARIO 2: Agent intervention needed - WILL trigger support request
+        print("SCENARIO 2: Waiting for 'Agent Success' text (needs agent)...")
+        print("   (This WILL trigger support request + hold)")
+        print("   ACTION: Type 'Agent Success' in DuckDuckGo to help!")
+        try:
+            page.wait_for_selector("text=Agent Success", timeout=5000)
+            print("   ✓ Found!")
+        except Exception as e:
+            print(f"   ✗ Timeout: {type(e).__name__}")
+            print(f"   → Raising NeedsAgentInterventionError...")
+            # Just raise it - the hook handles everything!
+            raise NeedsAgentInterventionError(f"Need help finding 'Agent Success': {e}")
         
-        print("STEP 5: Cleaning up...")
+        time.sleep(2)
+        print("STEP 3: Success! Cleaning up...")
         browser.close()
-        print("   ✓ Browser closed")
-        print()
-        
-        # Print big completion banner
         print_completion_banner()
 
 if __name__ == "__main__":
