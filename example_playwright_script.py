@@ -36,7 +36,7 @@ def print_completion_banner():
 def google_search_test():
     """Test script that demonstrates when support requests are triggered."""
     print("=" * 70)
-    print("   DUCKDUCKGO.COM TEST - NeedsAgentInterventionError Demo")
+    print("   GOOGLE.COM TEST - NeedsAgentInterventionError Demo")
     print("=" * 70)
     print()
     print("This script will demonstrate two scenarios:")
@@ -64,7 +64,7 @@ def google_search_test():
         
         # Navigate to DuckDuckGo
         print("STEP 2: Navigating to DuckDuckGo...")
-        page.goto("https://duckduckgo.com")
+        page.goto("https://google.com")
         print(f"   ✓ Current URL: {page.url}")
         print(f"   ✓ Page Title: {page.title()}")
         print()
