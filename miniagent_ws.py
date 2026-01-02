@@ -8,6 +8,8 @@ import logging
 import os
 import time
 import uuid
+import signal
+import sys
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Set, Tuple
 import threading
@@ -63,7 +65,7 @@ class MiniAgentWSClient:
                     time.sleep(self.reconnect_delay - (now - self.last_connect_attempt))
                 
                 self.last_connect_attempt = time.time()
-                logger.info(f"Connecting to {self.ws_url}...")
+                logger.debug(f"Connecting to {self.ws_url}...")
                 
                 self.ws = WebSocketApp(
                     self.ws_url,
@@ -84,7 +86,7 @@ class MiniAgentWSClient:
     
     def _on_open(self, ws):
         """Handle WebSocket open - send hello."""
-        logger.info("WebSocket connected, sending hello...")
+        logger.debug("WebSocket connected, sending hello...")
         self.connected = True
         
         hello_msg = {
@@ -98,7 +100,6 @@ class MiniAgentWSClient:
             ws.send(json.dumps(hello_msg))
         except Exception as e:
             logger.error(f"Failed to send hello: {e}")
-            self.connected = False
     
     def _on_message(self, ws, message):
         """Handle incoming WebSocket messages."""
@@ -145,7 +146,7 @@ class MiniAgentWSClient:
     
     def _on_close(self, ws, close_status_code, close_msg):
         """Handle WebSocket close."""
-        logger.info(f"WebSocket closed: {close_status_code} - {close_msg}")
+        logger.debug(f"WebSocket closed: {close_status_code} - {close_msg}")
         self.connected = False
         self.authenticated = False
     
@@ -189,6 +190,26 @@ class MiniAgentWSClient:
                 logger.info("Not authenticated yet, buffering support request")
                 self.pending_messages.append(msg)
     
+    def send_support_cancelled(self, payload: Dict[str, Any]):
+        """
+        Send a cancellation message for a support request. 
+        """
+        msg = {
+            "type": "support_cancelled",
+            "payload": payload
+        }
+        
+        with self.lock:
+            if self.authenticated and self.ws:
+                try:
+                    self.ws.send(json.dumps(msg))
+                    logger.info(f"Sent cancellation: {payload.get('reason', 'N/A')}")
+                except Exception as e:
+                    logger.error(f"Failed to send cancellation: {e}")
+                    # No buffering for cancellation - if it fails, it fails
+            else:
+                logger.info("Not authenticated, cannot send cancellation")
+    
     def close(self):
         """Close the WebSocket connection."""
         if self.ws:
@@ -210,6 +231,48 @@ class SupportRequestManager:
         # Generate a unique run ID for this process
         self.run_id = str(uuid.uuid4())[:8]
         self.pid = os.getpid()
+        
+        # Track active request for cancellation
+        self.active_request_id: Optional[str] = None
+        self.active_request_lock = threading.Lock()
+        
+        self._setup_signal_handlers()
+    
+    def _setup_signal_handlers(self):
+        """Set up signal handlers to cancel pending requests on exit."""
+        def handler(signum, frame):
+            sig_name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
+            logger.info(f"Received {sig_name}, cancelling active support requests...")
+            
+            # Cancel support request
+            self.cancel_support_request("signal_received")
+            
+            # Close WebSocket
+            self.ws_client.close()
+            
+            # Exit
+            sys.exit(0)
+            
+        try:
+            signal.signal(signal.SIGINT, handler)
+            signal.signal(signal.SIGTERM, handler)
+        except ValueError:
+            # Handles case where not running in main thread
+            logger.warning("Could not setup signal handlers (not main thread?)")
+    
+    def monitor_browser_close(self, browser):
+        """
+        Attach a listener to the Playwright browser to cancel the request
+        if the browser is closed (disconnected).
+        
+        Args:
+            browser: The Playwright Browser instance.
+        """
+        def on_disconnected(b):
+            logger.info("Browser disconnected, cancelling active support request...")
+            self.cancel_support_request("browser_closed")
+            
+        browser.on("disconnected", on_disconnected)
     
     def trigger_support_request(
         self,
@@ -227,19 +290,6 @@ class SupportRequestManager:
     ):
         """
         Trigger a support request with deduplication.
-        
-        Args:
-            reason: Error type/category (e.g., "TimeoutError")
-            details: Detailed error message
-            browser: Browser type ("chromium", "firefox", "webkit")
-            debug_port: Remote debugging port (Chromium only)
-            url: Current page URL
-            title: Current page title
-            page_id: Unique page identifier for deduplication
-            resume_endpoint: Optional dict with resume endpoint info (scheme, host, port, path, token)
-            success_selector: Optional CSS selector that indicates successful completion (e.g., element agent was trying to reach)
-            failure_selector: Optional CSS selector that indicates failure (e.g., error message element)
-            cdp_target_id: Optional CDP Target ID for the specific page
         """
         page_id = page_id or "default"
         
@@ -307,7 +357,29 @@ class SupportRequestManager:
         if cdp_target_id:
             log_msg += f" (targetId: {cdp_target_id})"
         logger.info(log_msg)
+        
+        with self.active_request_lock:
+            self.active_request_id = self.run_id
+            
         self.ws_client.send_support_request(payload)
+
+    def cancel_support_request(self, reason: str):
+        """
+        Cancel the current active support request if any.
+        """
+        with self.active_request_lock:
+            if not self.active_request_id:
+                return
+            
+            # Send cancellation
+            payload = {
+                "runId": self.active_request_id,
+                "reason": reason,
+                "ts": datetime.now(timezone.utc).isoformat()
+            }
+            
+            self.ws_client.send_support_cancelled(payload)
+            self.active_request_id = None
 
 
 # Global singleton instances
@@ -341,5 +413,3 @@ def get_support_manager() -> Optional[SupportRequestManager]:
     except Exception as e:
         logger.error(f"Failed to initialize MiniAgent: {e}")
         return None
-
-

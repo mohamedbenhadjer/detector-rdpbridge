@@ -12,6 +12,8 @@ import threading
 import json
 import socket
 import urllib.request
+import signal
+import atexit
 from pathlib import Path
 from typing import Optional, Any, Dict
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -173,13 +175,17 @@ def _hold_deadline():
         return None
 
 
-def _park_until_resume(reason: str, details: str):
+def _park_until_resume(reason: str, details: str, page_obj=None):
     """
-    Block the process until resume signal or timeout.
+    Block the process until resume signal, timeout, or browser closed.
     Resume happens when MINIAGENT_RESUME_FILE is created or deadline is reached.
     """
     logger.warning(f"Holding on error ({reason}) - waiting for agent. Resume file: {_RESUME_FILE}")
     deadline = _hold_deadline()
+    
+    # Get manager for cancellation
+    from miniagent_ws import get_support_manager
+    manager = get_support_manager()
     
     while True:
         try:
@@ -196,8 +202,55 @@ def _park_until_resume(reason: str, details: str):
         if deadline and time.time() >= deadline:
             logger.info("Hold timeout reached; continuing.")
             return
-        
+            
+        # Check if browser/page is closed
+        if page_obj:
+            try:
+                if hasattr(page_obj, "is_closed") and page_obj.is_closed():
+                    logger.info("Page closed during hold; cancelling support request.")
+                    if manager:
+                        manager.cancel_support_request("browser_closed")
+                    # If browser closed, we should probably just exit or return to let the error propagate
+                    sys.exit(1) # Exit script as browser is gone
+            except Exception:
+                pass
+                
         time.sleep(1.0)
+
+
+def _handle_signal(signum, frame):
+    """Handle termination signals (Ctrl+C, etc)."""
+    logger.info(f"Signal {signum} received, cancelling support request...")
+    
+    try:
+        from miniagent_ws import get_support_manager
+        manager = get_support_manager()
+        if manager:
+            manager.cancel_support_request("signal_received")
+    except Exception:
+        pass
+        
+    # Exit cleanly
+    sys.exit(signum)
+
+
+def _handle_exit():
+    """Handle interpreter exit (normal or exception)."""
+    # Only cancel if we have an active request
+    # This runs for normal exit, caught exceptions, etc.
+    try:
+        from miniagent_ws import get_support_manager
+        manager = get_support_manager()
+        if manager and manager.active_request_id:
+            logger.info("Script exiting with active support request, cancelling...")
+            manager.cancel_support_request("script_exited")
+            # Give a small moment for the socket send to flush if needed
+            time.sleep(0.2)
+    except Exception:
+        pass
+
+
+atexit.register(_handle_exit)
 
 
 class _ResumeRequestHandler(BaseHTTPRequestHandler):
@@ -623,7 +676,12 @@ def _intercept_playwright():
                         # Hold if needed (browser stays open during hold)
                         if _MODE == "hold":
                             logger.warning(f"Holding on error - browser will stay open. Resume file: {_RESUME_FILE}")
-                            _park_until_resume(exc_type.__name__, str(exc_val))
+                            # Resolve page object if available from context
+                            page_obj = None
+                            if hasattr(exc_val, "page"):
+                                page_obj = exc_val.page
+                            
+                            _park_until_resume(exc_type.__name__, str(exc_val), page_obj)
                             # After resume, suppress the exception and continue
                             return True  # Suppress exception
                         elif _MODE == "swallow":
@@ -644,6 +702,14 @@ def _intercept_playwright():
             
     except ImportError:
         logger.debug("Could not import Browser for context manager patching")
+        
+    # Register signal handlers
+    try:
+        signal.signal(signal.SIGINT, _handle_signal)
+        signal.signal(signal.SIGTERM, _handle_signal)
+        logger.debug("Registered signal handlers for cancellation")
+    except Exception as e:
+        logger.warning(f"Failed to register signal handlers: {e}")
     
     # Track browser info per launch
     _browser_info: Dict[int, Dict[str, Any]] = {}
@@ -1040,7 +1106,7 @@ def _intercept_playwright():
                     
                     # Handle based on mode (only for NeedsAgentInterventionError)
                     if _MODE == "hold":
-                        _park_until_resume(error_type, error_msg)
+                        _park_until_resume(error_type, error_msg, page_obj)
                         # DON'T re-raise - return None to continue (keeps browser open)
                         return None
                     if _MODE == "swallow":
@@ -1127,6 +1193,19 @@ def _intercept_playwright():
                             if deadline and time.time() >= deadline:
                                 logger.info("Hold timeout reached; continuing.")
                                 return None
+                                
+                            # Check if page is closed
+                            if page_obj:
+                                try:
+                                    if hasattr(page_obj, "is_closed") and page_obj.is_closed():
+                                        logger.info("Page closed during hold; cancelling support request.")
+                                        if manager:
+                                            manager.cancel_support_request("browser_closed")
+                                        # Exit script as browser is gone
+                                        sys.exit(1) 
+                                except Exception:
+                                    pass
+                                    
                             await asyncio.sleep(1.0)
                     
                     if _MODE == "swallow":
@@ -1230,7 +1309,15 @@ def _handle_exception(exc_type, exc_value, exc_traceback):
                 
                 # Handle based on mode (hold/swallow for NeedsAgentInterventionError)
                 if _MODE == "hold":
-                    _park_until_resume(exc_type.__name__, str(exc_value))
+                    # Get page_obj from weakref if possible
+                    page_obj = None
+                    if _last_active_page_ref:
+                        try:
+                            page_obj = _last_active_page_ref()
+                        except:
+                            pass
+                            
+                    _park_until_resume(exc_type.__name__, str(exc_value), page_obj)
                     # Don't call original excepthook - we handled it
                     return
                 if _MODE == "swallow":
