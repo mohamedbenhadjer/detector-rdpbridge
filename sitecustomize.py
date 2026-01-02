@@ -187,6 +187,29 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
     from miniagent_ws import get_support_manager
     manager = get_support_manager()
     
+    # Try to resolve browser/context from page_obj if possible
+    browser_or_context = None
+    
+    # Fallback to last active page if not provided
+    if not page_obj:
+        try:
+            global _last_active_page_ref
+            if _last_active_page_ref:
+                page_obj = _last_active_page_ref()
+        except:
+            pass
+
+    if page_obj:
+        try:
+            if hasattr(page_obj, "context"):
+                browser_or_context = page_obj.context
+                if hasattr(browser_or_context, "browser") and browser_or_context.browser:
+                    browser_or_context = browser_or_context.browser
+        except:
+            pass
+    
+    
+    
     while True:
         try:
             if _RESUME_FILE and Path(_RESUME_FILE).exists():
@@ -198,10 +221,11 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
                 return
         except Exception:
             pass
-        
-        if deadline and time.time() >= deadline:
-            logger.info("Hold timeout reached; continuing.")
-            return
+            
+        # Check if request was cancelled (e.g. by signal or browser close callback)
+        if manager and not manager.active_request_id:
+            logger.info("Support request cancelled; exiting hold.")
+            sys.exit(1)
             
         # Check if browser/page is closed
         if page_obj:
@@ -210,9 +234,35 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
                     logger.info("Page closed during hold; cancelling support request.")
                     if manager:
                         manager.cancel_support_request("browser_closed")
-                    # If browser closed, we should probably just exit or return to let the error propagate
-                    sys.exit(1) # Exit script as browser is gone
+                    sys.exit(1)
             except Exception:
+                pass
+        
+        # Check if browser is disconnected (more reliable for window close)
+        if browser_or_context:
+            try:
+                # Handle both Browser and BrowserContext
+                is_connected = True
+                if hasattr(browser_or_context, "is_connected"):
+                    is_connected = browser_or_context.is_connected()
+                
+                # Active check if seemingly connected
+                if is_connected and page_obj:
+                     try:
+                         # Verify connection is actually alive by sending a cheap command
+                         if hasattr(page_obj, "evaluate"):
+                             page_obj.evaluate("1")
+                     except Exception:
+                         is_connected = False
+                
+                
+                if not is_connected:
+                    logger.info("Browser disconnected during hold; cancelling support request.")
+                    if manager:
+                        manager.cancel_support_request("browser_closed")
+                    sys.exit(1)
+            except Exception as e:
+                # logger.warning(f"Error checking browser status: {e}") 
                 pass
                 
         time.sleep(1.0)
@@ -808,6 +858,15 @@ def _intercept_playwright():
                 "debug_port": None
             }
         
+        # Monitor for browser close
+        try:
+            from miniagent_ws import get_support_manager
+            manager = get_support_manager()
+            if manager:
+                manager.monitor_browser_close(browser)
+        except Exception as e:
+            logger.warning(f"Failed to attach browser monitor: {e}")
+        
         return browser
     
     SyncBrowserType.launch = _patched_sync_launch
@@ -854,6 +913,15 @@ def _intercept_playwright():
         except Exception as e:
             logger.debug(f"Could not install popup prevention on persistent context pages: {e}")
         
+        # Monitor for browser close (context)
+        try:
+            from miniagent_ws import get_support_manager
+            manager = get_support_manager()
+            if manager:
+                manager.monitor_browser_close(context)
+        except Exception as e:
+            logger.warning(f"Failed to attach context monitor: {e}")
+
         return context
     
     SyncBrowserType.launch_persistent_context = _patched_sync_launch_persistent
