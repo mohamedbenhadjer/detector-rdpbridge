@@ -55,8 +55,8 @@ def main():
     # Wait for server to start
     time.sleep(2)
     
-    # Use venv python
-    python_exe = os.path.join("venv", "bin", "python")
+    # Use myenv python
+    python_exe = os.path.join(os.getcwd(), "myenv", "bin", "python")
     
     # Run the playwright script with a custom behavior
     # We want to simulate successful resumption and then a random exit
@@ -159,6 +159,13 @@ def main():
     print("\n\nMessages received:")
     for msg in received_messages:
         print(f"- {msg.get('type')}: {msg.get('payload', {}).get('reason', 'N/A')}")
+        
+    # Print subprocess output for debugging
+    stdout, stderr = proc.communicate()
+    print("\n--- Subprocess STDOUT ---")
+    print(stdout)
+    print("\n--- Subprocess STDERR ---")
+    print(stderr)
         
     # Verify
     has_cancel = any(m.get("type") == "support_cancelled" for m in received_messages)

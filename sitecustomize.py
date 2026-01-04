@@ -127,6 +127,159 @@ def _find_free_debug_port(base_port: int, max_attempts: int = 50) -> int:
     return base_port
 
 
+    return None
+
+
+# === Process and PID Monitoring ===
+
+def _get_process_tree_linux():
+    """Builds a dict of ppid -> list of child pids from /proc (Linux only)."""
+    tree = {}
+    cmdlines = {}
+    try:
+        # PIDs are directories in /proc that are all digits
+        pids = [pid for pid in os.listdir('/proc') if pid.isdigit()]
+        for pid_str in pids:
+            try:
+                pid = int(pid_str)
+                # Read ppid from /proc/pid/stat
+                with open(f'/proc/{pid}/stat', 'r') as f:
+                    stat = f.read().strip()
+                    # stat format: pid (comm) state ppid ...
+                    # We skip 'comm' because it can contain spaces and parens.
+                    # reliably finding the last ')' is the standard way.
+                    r_paren = stat.rfind(')')
+                    if r_paren == -1: continue
+                    
+                    rest = stat[r_paren+1:].split()
+                    if len(rest) > 1:
+                        ppid = int(rest[1])
+                        if ppid not in tree:
+                            tree[ppid] = []
+                        tree[ppid].append(pid)
+                
+                # Read cmdline from /proc/pid/cmdline
+                try:
+                    with open(f'/proc/{pid}/cmdline', 'r') as f:
+                        # Cmdline arguments are null-separated
+                        cmd = f.read().replace('\0', ' ').strip()
+                        cmdlines[pid] = cmd
+                except:
+                    cmdlines[pid] = ""
+                    
+            except (FileNotFoundError, PermissionError, ValueError):
+                continue
+    except Exception as e:
+        logger.debug(f"Error scanning /proc: {e}")
+        
+    return tree, cmdlines
+
+def _get_process_tree_windows():
+    """Builds a process tree using wmic (Windows only)."""
+    tree = {}
+    cmdlines = {}
+    try:
+        import subprocess
+        # Get ProcessId, ParentProcessId, CommandLine
+        cmd = 'wmic process get ProcessId,ParentProcessId,CommandLine /FORMAT:csv'
+        # Run wmic, suppress window creation on Windows if needed (startupinfo)
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
+        output = subprocess.check_output(cmd, shell=True, startupinfo=startupinfo, text=True)
+        
+        lines = output.strip().splitlines()
+        # First line is blank or headers. CSV format: Node,CommandLine,ParentProcessId,ProcessId
+        # Headers: Node,CommandLine,ParentProcessId,ProcessId
+        
+        for line in lines:
+            if not line.strip(): continue
+            parts = line.split(',')
+            if len(parts) < 4: continue
+            
+            # Skip header
+            if "ProcessId" in parts[-1] and "ParentProcessId" in parts[-2]:
+                continue
+                
+            try:
+                # WMIC CSV sometimes puts the value at the end
+                # Format: Node, CommandLine, ParentProcessId, ProcessId
+                pid = int(parts[-1])
+                ppid = int(parts[-2])
+                cmd = parts[1] # This might be truncated if it contains commas? 
+                # Actually wmic CSV output is tricky with commas in values.
+                # But typically CommandLine is the big string.
+                # Let's hope basic split works, or we might need robust CSV parsing.
+                # For basic browsing detection, "chrome.exe" usually appears even if split is wrong.
+                
+                if ppid not in tree:
+                    tree[ppid] = []
+                tree[ppid].append(pid)
+                
+                cmdlines[pid] = cmd
+            except ValueError:
+                continue
+                
+    except Exception as e:
+        logger.debug(f"Error checking processes via wmic: {e}")
+        
+    return tree, cmdlines
+
+def _get_process_tree():
+    """Get process tree for current OS."""
+    if os.name == 'posix':
+        # Linux/Mac (though Mac /proc is different/non-existent, we assume Linux based on env)
+        # If Mac, this would likely fail empty or need psutil. 
+        # But User says Linux.
+        return _get_process_tree_linux()
+    else:
+        return _get_process_tree_windows()
+
+def _find_browser_pid(root_pid: int) -> Optional[int]:
+    """
+    Find the main browser process ID that is a descendant of root_pid.
+    We look for 'chrome', 'chromium', 'msedge' with no '--type=' argument (main process usually).
+    """
+    tree, cmdlines = _get_process_tree()
+    
+    # BFS traversal
+    queue = [root_pid]
+    candidates = []
+    
+    # Safety: avoid infinite loops if cycle in tree (rare)
+    visited = {root_pid}
+    
+    while queue:
+        current_pid = queue.pop(0)
+        
+        # Check current process
+        cmd = cmdlines.get(current_pid, "").lower()
+        if any(x in cmd for x in ["chrome", "chromium", "msedge", "firefox", "webkit", "safari"]):
+            # Heuristic: Main process usually doesn't have --type=renderer etc.
+            # But Playwright launches wrapper scripts too.
+            candidates.append((current_pid, cmd))
+            
+        # Add children
+        children = tree.get(current_pid, [])
+        for child in children:
+            if child not in visited:
+                visited.add(child)
+                queue.append(child)
+    
+    if not candidates:
+        return None
+        
+    # Filter for main process (no --type=)
+    for pid, cmd in candidates:
+        if "--type=" not in cmd:
+            return pid
+            
+    # Fallback: return the first candidate (closest to root)
+    return candidates[0][0]
+
+
 def _get_cdp_target_id(debug_port: int, page_url: str) -> Optional[str]:
     """
     Query DevTools Protocol to find target ID matching the page URL.
@@ -230,6 +383,33 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
         # Check if browser/page is closed
         if page_obj:
             try:
+                # If we have a PID, check it first as it's the source of truth
+                browser_pid = None
+                
+                # Try to get PID from browser info if available
+                if browser_or_context:
+                    # Resolve to browser object if context
+                    browser_ref = browser_or_context
+                    if hasattr(browser_ref, "browser") and browser_ref.browser:
+                        browser_ref = browser_ref.browser
+                    
+                    if id(browser_ref) in _browser_info:
+                         browser_pid = _browser_info[id(browser_ref)].get("pid")
+                
+                # Perform PID liveness check if we found one
+                if browser_pid:
+                    try:
+                        # os.kill(pid, 0) checks if process exists; raises OSError if not
+                        os.kill(browser_pid, 0)
+                    except OSError:
+                        logger.info(f"Browser process {browser_pid} is gone; cancelling support request.")
+                        if manager:
+                            manager.cancel_support_request("browser_closed")
+                        sys.exit(1)
+                
+                # Fallback to page.is_closed() if no PID or just as secondary check
+                # But be careful: is_closed() might detect navigation as closure? 
+                # Actually is_closed() usually means the page target is gone.
                 if hasattr(page_obj, "is_closed") and page_obj.is_closed():
                     logger.info("Page closed during hold; cancelling support request.")
                     if manager:
@@ -238,29 +418,23 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
             except Exception:
                 pass
         
-        # Check if browser is disconnected (more reliable for window close)
+        # Check if browser is disconnected (secondary check)
         if browser_or_context:
             try:
-                # Handle both Browser and BrowserContext
-                is_connected = True
-                if hasattr(browser_or_context, "is_connected"):
-                    is_connected = browser_or_context.is_connected()
+                # PID check is authoritative, so we only use is_connected if we didn't have a PID
+                # or if we want to confirm connection status. 
+                # If PID is alive, we ignore temporary disconnections.
                 
-                # Active check if seemingly connected
-                if is_connected and page_obj:
-                     try:
-                         # Verify connection is actually alive by sending a cheap command
-                         if hasattr(page_obj, "evaluate"):
-                             page_obj.evaluate("1")
-                     except Exception:
-                         is_connected = False
-                
-                
-                if not is_connected:
-                    logger.info("Browser disconnected during hold; cancelling support request.")
-                    if manager:
-                        manager.cancel_support_request("browser_closed")
-                    sys.exit(1)
+                if not browser_pid:
+                    is_connected = True
+                    if hasattr(browser_or_context, "is_connected"):
+                        is_connected = browser_or_context.is_connected()
+                    
+                    if not is_connected:
+                         logger.info("Browser disconnected during hold (no PID found); cancelling support request.")
+                         if manager:
+                             manager.cancel_support_request("browser_closed")
+                         sys.exit(1)
             except Exception as e:
                 # logger.warning(f"Error checking browser status: {e}") 
                 pass
@@ -846,16 +1020,20 @@ def _intercept_playwright():
         browser = _orig_sync_launch(self, *args, **kwargs)
         
         # Store browser info with the actual debug port used
+        pid = _find_browser_pid(os.getpid())
+        
         if browser_name in ("chromium", "chrome", "msedge"):
             _browser_info[id(browser)] = {
                 "browser": browser_name,
-                "debug_port": debug_port
+                "debug_port": debug_port,
+                "pid": pid
             }
-            logger.info(f"Chromium launched with debug port {debug_port}")
+            logger.info(f"Chromium launched with debug port {debug_port}, PID {pid}")
         else:
             _browser_info[id(browser)] = {
                 "browser": "firefox" if browser_name == "firefox" else "webkit",
-                "debug_port": None
+                "debug_port": None,
+                "pid": pid
             }
         
         # Monitor for browser close
@@ -899,9 +1077,13 @@ def _intercept_playwright():
             
             logger.info(f"Chromium persistent context launched with debug port {debug_port}")
         
+        # Find browser PID
+        pid = _find_browser_pid(os.getpid())
+        
         _browser_info[id(context)] = {
             "browser": browser_name if browser_name in ("chromium", "firefox", "webkit") else "chromium",
-            "debug_port": debug_port
+            "debug_port": debug_port,
+            "pid": pid
         }
         
         # Install popup prevention on persistent context
@@ -1063,6 +1245,7 @@ def _intercept_playwright():
             elif page_obj and hasattr(page_obj, "_impl") and hasattr(page_obj._impl, "_browser_type"):
                 bt_name = page_obj._impl._browser_type.name
                 browser_info["browser"] = bt_name if bt_name in ("firefox", "webkit") else "chromium"
+                browser_info["pid"] = None # Can't easily determine pid in fallback
         except Exception:
             pass
         
@@ -1084,6 +1267,7 @@ def _intercept_playwright():
             
         return {
             "browser": browser_info["browser"],
+            "pid": browser_info.get("pid"),
             "debug_port": browser_info.get("debug_port"),
             "url": page_info.get("url"),
             "title": page_info.get("title"),
