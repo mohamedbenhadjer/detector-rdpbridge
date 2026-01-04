@@ -256,6 +256,8 @@ class SupportRequestManager:
         try:
             signal.signal(signal.SIGINT, handler)
             signal.signal(signal.SIGTERM, handler)
+            if hasattr(signal, "SIGHUP"):
+                signal.signal(signal.SIGHUP, handler)
         except ValueError:
             # Handles case where not running in main thread
             logger.warning("Could not setup signal handlers (not main thread?)")

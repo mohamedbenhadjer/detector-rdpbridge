@@ -931,6 +931,9 @@ def _intercept_playwright():
     try:
         signal.signal(signal.SIGINT, _handle_signal)
         signal.signal(signal.SIGTERM, _handle_signal)
+        # Handle SIGHUP (terminal closed)
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, _handle_signal)
         logger.debug("Registered signal handlers for cancellation")
     except Exception as e:
         logger.warning(f"Failed to register signal handlers: {e}")
