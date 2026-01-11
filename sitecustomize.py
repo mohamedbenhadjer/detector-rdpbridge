@@ -980,11 +980,12 @@ def _intercept_playwright():
                         chosen_port = _DEBUG_PORT
                     break
         
-        # Add flags to keep background/occluded tabs rendering
+        # Add flags to keep background/occluded tabs rendering and start maximized
         args.extend([
             "--disable-backgrounding-occluded-windows",
             "--disable-renderer-backgrounding",
             "--disable-background-timer-throttling",
+            "--start-maximized"
         ])
         
         return args, chosen_port
@@ -1138,17 +1139,27 @@ def _intercept_playwright():
         _orig_sync_browser_new_context = SyncBrowser.new_context
         
         def _patched_sync_browser_new_context(self, *args, **kwargs):
+            # Force no_viewport=True to allow window processing to handle resize naturally
+            if "no_viewport" not in kwargs and "viewport" not in kwargs:
+                kwargs["no_viewport"] = True
+                logger.debug("Forcing no_viewport=True for natural window resizing")
+            
             context = _orig_sync_browser_new_context(self, *args, **kwargs)
             _install_popup_prevention_on_context(context)
             return context
         
         SyncBrowser.new_context = _patched_sync_browser_new_context
-        logger.debug("Patched sync Browser.new_context for popup prevention")
+        logger.debug("Patched sync Browser.new_context for popup prevention and resizing")
         
         # Patch sync Browser.new_page (creates implicit context + page)
         _orig_sync_browser_new_page = SyncBrowser.new_page
         
         def _patched_sync_browser_new_page(self, *args, **kwargs):
+            # Force no_viewport=True to allow window processing to handle resize naturally
+            if "no_viewport" not in kwargs and "viewport" not in kwargs:
+                kwargs["no_viewport"] = True
+                logger.debug("Forcing no_viewport=True for natural window resizing")
+
             page = _orig_sync_browser_new_page(self, *args, **kwargs)
             # Install on page and also on its context for future pages
             _install_popup_prevention_on_page(page)
@@ -1157,7 +1168,7 @@ def _intercept_playwright():
             return page
         
         SyncBrowser.new_page = _patched_sync_browser_new_page
-        logger.debug("Patched sync Browser.new_page for popup prevention")
+        logger.debug("Patched sync Browser.new_page for popup prevention and resizing")
     
     # Import async Browser and BrowserContext classes
     try:
@@ -1184,17 +1195,27 @@ def _intercept_playwright():
         _orig_async_browser_new_context = AsyncBrowser.new_context
         
         async def _patched_async_browser_new_context(self, *args, **kwargs):
+            # Force no_viewport=True to allow window processing to handle resize naturally
+            if "no_viewport" not in kwargs and "viewport" not in kwargs:
+                kwargs["no_viewport"] = True
+                logger.debug("Forcing no_viewport=True for natural window resizing")
+            
             context = await _orig_async_browser_new_context(self, *args, **kwargs)
             _install_popup_prevention_on_context_async(context)
             return context
         
         AsyncBrowser.new_context = _patched_async_browser_new_context
-        logger.debug("Patched async Browser.new_context for popup prevention")
+        logger.debug("Patched async Browser.new_context for popup prevention and resizing")
         
         # Patch async Browser.new_page (creates implicit context + page)
         _orig_async_browser_new_page = AsyncBrowser.new_page
         
         async def _patched_async_browser_new_page(self, *args, **kwargs):
+            # Force no_viewport=True to allow window processing to handle resize naturally
+            if "no_viewport" not in kwargs and "viewport" not in kwargs:
+                kwargs["no_viewport"] = True
+                logger.debug("Forcing no_viewport=True for natural window resizing")
+
             page = await _orig_async_browser_new_page(self, *args, **kwargs)
             # Install on page and also on its context for future pages
             await _install_popup_prevention_on_page_async(page)
@@ -1203,7 +1224,7 @@ def _intercept_playwright():
             return page
         
         AsyncBrowser.new_page = _patched_async_browser_new_page
-        logger.debug("Patched async Browser.new_page for popup prevention")
+        logger.debug("Patched async Browser.new_page for popup prevention and resizing")
     
     # === Error interception ===
     

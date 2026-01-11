@@ -86,7 +86,8 @@ class MiniAgentWSClient:
     
     def _on_open(self, ws):
         """Handle WebSocket open - send hello."""
-        logger.debug("WebSocket connected, sending hello...")
+        logger.info(f"WebSocket connection opened to {self.ws_url}")
+        logger.debug("Sending hello handshake...")
         self.connected = True
         
         hello_msg = {
@@ -98,8 +99,10 @@ class MiniAgentWSClient:
         
         try:
             ws.send(json.dumps(hello_msg))
+            logger.info("Hello message sent successfully")
         except Exception as e:
             logger.error(f"Failed to send hello: {e}")
+            self.connected = False
     
     def _on_message(self, ws, message):
         """Handle incoming WebSocket messages."""
@@ -108,7 +111,7 @@ class MiniAgentWSClient:
             msg_type = data.get("type")
             
             if msg_type == "hello_ack":
-                logger.info("Handshake complete")
+                logger.info("Handshake complete - Client Authenticated")
                 self.authenticated = True
                 self.reconnect_delay = 0.5  # Reset backoff on success
                 self._flush_pending()
@@ -121,7 +124,7 @@ class MiniAgentWSClient:
             elif msg_type == "error":
                 error_code = data.get("code")
                 error_msg = data.get("message", "Unknown error")
-                logger.error(f"Server error: {error_code} - {error_msg}")
+                logger.error(f"Server error received: {error_code} - {error_msg}")
                 
                 if error_code == "BAD_AUTH":
                     logger.error("Authentication failed - check MINIAGENT_TOKEN")
@@ -130,23 +133,26 @@ class MiniAgentWSClient:
                     logger.warning("No signed-in user - will retry later")
             
             elif msg_type == "pong":
-                pass  # Heartbeat response
+                # Heartbeat response - debug level only
+                logger.debug("Received pong")
             
             else:
-                logger.debug(f"Received: {data}")
+                logger.debug(f"Received message type: {msg_type}")
+                if "payload" in data:
+                    logger.debug(f"Payload: {data['payload']}")
         
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to decode message: {e}")
-    
+            logger.error(f"Failed to decode message: {e} | Raw message: {message[:100]}...")
+            
     def _on_error(self, ws, error):
         """Handle WebSocket errors."""
-        logger.error(f"WebSocket error: {error}")
+        logger.error(f"WebSocket error occurred: {error}")
         self.connected = False
         self.authenticated = False
     
     def _on_close(self, ws, close_status_code, close_msg):
         """Handle WebSocket close."""
-        logger.debug(f"WebSocket closed: {close_status_code} - {close_msg}")
+        logger.info(f"WebSocket connection closed. Code: {close_status_code}, Msg: {close_msg}")
         self.connected = False
         self.authenticated = False
     
