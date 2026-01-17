@@ -282,6 +282,20 @@ class SupportRequestManager:
             
         browser.on("disconnected", on_disconnected)
     
+    def monitor_page_close(self, page):
+        """
+        Attach a listener to the Playwright page to cancel the request
+        if the page is closed.
+        
+        Args:
+            page: The Playwright Page instance.
+        """
+        def on_close(p):
+            logger.info("Page closed, cancelling active support request...")
+            self.cancel_support_request("page_closed")
+            
+        page.on("close", on_close)
+    
     def trigger_support_request(
         self,
         reason: str,
