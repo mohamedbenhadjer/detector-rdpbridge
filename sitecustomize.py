@@ -407,24 +407,17 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
                             manager.cancel_support_request("browser_closed")
                         sys.exit(1)
                 
-                # Fallback to page.is_closed() if no PID or just as secondary check
-                # But be careful: is_closed() might detect navigation as closure? 
-                # Actually is_closed() usually means the page target is gone.
-                if hasattr(page_obj, "is_closed") and page_obj.is_closed():
-                    logger.info("Page closed during hold; cancelling support request.")
-                    if manager:
-                        manager.cancel_support_request("browser_closed")
-                    sys.exit(1)
+                # Fallback to page.is_closed()
+                # We removed the active polling for cancellation here because monitor_page_close
+                # should handle it via event. But we can keep a passive check if needed.
+                pass
             except Exception:
                 pass
         
         # Check if browser is disconnected (secondary check)
         if browser_or_context:
             try:
-                # PID check is authoritative, so we only use is_connected if we didn't have a PID
-                # or if we want to confirm connection status. 
-                # If PID is alive, we ignore temporary disconnections.
-                
+                # PID check is authoritative, usually.
                 if not browser_pid:
                     is_connected = True
                     if hasattr(browser_or_context, "is_connected"):
@@ -435,11 +428,21 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
                          if manager:
                              manager.cancel_support_request("browser_closed")
                          sys.exit(1)
-            except Exception as e:
-                # logger.warning(f"Error checking browser status: {e}") 
+            except Exception:
                 pass
                 
-        time.sleep(1.0)
+        # Use wait_for_timeout if possible to spin event loop
+        did_wait = False
+        if page_obj and hasattr(page_obj, "wait_for_timeout"):
+            try:
+                page_obj.wait_for_timeout(1000)
+                did_wait = True
+            except Exception:
+                # Page might be closed or error during wait
+                pass
+        
+        if not did_wait:
+            time.sleep(1.0)
 
 
 def _handle_signal(signum, frame):
@@ -1105,6 +1108,9 @@ def _intercept_playwright():
             manager = get_support_manager()
             if manager:
                 manager.monitor_browser_close(context)
+                # Monitor existing pages too
+                for page in context.pages:
+                    manager.monitor_page_close(page)
         except Exception as e:
             logger.warning(f"Failed to attach context monitor: {e}")
 
@@ -1129,10 +1135,20 @@ def _intercept_playwright():
         def _patched_sync_context_new_page(self, *args, **kwargs):
             page = _orig_sync_context_new_page(self, *args, **kwargs)
             _install_popup_prevention_on_page(page)
+            
+            # Monitor page close
+            try:
+                from miniagent_ws import get_support_manager
+                manager = get_support_manager()
+                if manager:
+                    manager.monitor_page_close(page)
+            except Exception:
+                pass
+                
             return page
         
         SyncBrowserContext.new_page = _patched_sync_context_new_page
-        logger.debug("Patched sync BrowserContext.new_page for popup prevention")
+        logger.debug("Patched sync BrowserContext.new_page for popup prevention and monitoring")
     
     # Patch sync Browser.new_context
     if SyncBrowser:
@@ -1165,10 +1181,20 @@ def _intercept_playwright():
             _install_popup_prevention_on_page(page)
             if hasattr(page, 'context'):
                 _install_popup_prevention_on_context(page.context)
+            
+            # Monitor page close
+            try:
+                from miniagent_ws import get_support_manager
+                manager = get_support_manager()
+                if manager:
+                    manager.monitor_page_close(page)
+            except Exception:
+                pass
+
             return page
         
         SyncBrowser.new_page = _patched_sync_browser_new_page
-        logger.debug("Patched sync Browser.new_page for popup prevention and resizing")
+        logger.debug("Patched sync Browser.new_page for popup prevention, resizing and monitoring")
     
     # Import async Browser and BrowserContext classes
     try:
@@ -1185,10 +1211,20 @@ def _intercept_playwright():
         async def _patched_async_context_new_page(self, *args, **kwargs):
             page = await _orig_async_context_new_page(self, *args, **kwargs)
             await _install_popup_prevention_on_page_async(page)
+            
+            # Monitor page close
+            try:
+                from miniagent_ws import get_support_manager
+                manager = get_support_manager()
+                if manager:
+                    manager.monitor_page_close(page)
+            except Exception:
+                pass
+                
             return page
         
         AsyncBrowserContext.new_page = _patched_async_context_new_page
-        logger.debug("Patched async BrowserContext.new_page for popup prevention")
+        logger.debug("Patched async BrowserContext.new_page for popup prevention and monitoring")
     
     # Patch async Browser.new_context
     if AsyncBrowser:
@@ -1221,10 +1257,20 @@ def _intercept_playwright():
             await _install_popup_prevention_on_page_async(page)
             if hasattr(page, 'context'):
                 _install_popup_prevention_on_context_async(page.context)
+            
+            # Monitor page close
+            try:
+                from miniagent_ws import get_support_manager
+                manager = get_support_manager()
+                if manager:
+                    manager.monitor_page_close(page)
+            except Exception:
+                pass
+
             return page
         
         AsyncBrowser.new_page = _patched_async_browser_new_page
-        logger.debug("Patched async Browser.new_page for popup prevention and resizing")
+        logger.debug("Patched async Browser.new_page for popup prevention, resizing and monitoring")
     
     # === Error interception ===
     
@@ -1470,17 +1516,12 @@ def _intercept_playwright():
                                 logger.info("Hold timeout reached; continuing.")
                                 return None
                                 
-                            # Check if page is closed
-                            if page_obj:
-                                try:
-                                    if hasattr(page_obj, "is_closed") and page_obj.is_closed():
-                                        logger.info("Page closed during hold; cancelling support request.")
-                                        if manager:
-                                            manager.cancel_support_request("browser_closed")
-                                        # Exit script as browser is gone
-                                        sys.exit(1) 
-                                except Exception:
-                                    pass
+                            # Check if page is closed - handled by event listener now
+                            # But we keep a check just in case the event listener failed or wasn't attached
+                            # However, user requested to make it like "when no hold is there"
+                            # The event listener in SupportRequestManager calls cancel_support_request
+                            # which sets active_request_id to None, helping us exit the loop.
+                            pass
                                     
                             await asyncio.sleep(1.0)
                     
