@@ -50,7 +50,7 @@ def google_search_test():
         # Launch browser (hook will inject debug port for Chromium)
         print("STEP 1: Launching Chromium browser...")
         browser = p.chromium.launch(
-            headless=False,
+            headless=True,
             slow_mo=500,
             args=[
                 "--disable-backgrounding-occluded-windows",
