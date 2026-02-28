@@ -64,7 +64,7 @@ def google_search_test():
         
         # Navigate to DuckDuckGo
         print("STEP 2: Navigating to DuckDuckGo...")
-        page.goto("https://google.com")
+        page.goto("https://duckduckgo.com")
         print(f"   ✓ Current URL: {page.url}")
         print(f"   ✓ Page Title: {page.title()}")
         print()
