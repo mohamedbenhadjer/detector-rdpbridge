@@ -442,8 +442,9 @@ def _print_menu(console):
         f"  [bold][1][/] Spawn N agents\n"
         f"  [bold][2][/] Stop all agents\n"
         f"  [bold][3][/] View logs\n"
-        f"  [bold][4][/] View agent session (open browser)\n"
+        f"  [bold][4][/] View sessions (live from DB)\n"
         f"  [bold][5][/] Cleanup (delete test agents)\n"
+        f"  [bold][6][/] View all recent DB sessions\n"
         f"  [bold][q][/] Quit",
         title="[bold cyan]AGENT SIMULATOR[/]",
         border_style="cyan",
@@ -503,90 +504,311 @@ def _view_logs(console):
             console.print(f"  [red]Agent #{idx} not found.[/]")
 
 
-def _view_session(console):
-    """Open a browser to view an agent's session."""
-    # List agents with accepted requests
-    agents_with_sessions = [a for a in _agents if a.last_accepted_request]
+async def _fetch_real_sessions(access_token: Optional[str] = None, include_recent: bool = False) -> list[dict]:
+    """Fetch real sessions from the Supabase sessions table.
 
-    if not agents_with_sessions:
-        console.print("  [yellow]No agents have accepted sessions yet.[/]")
-        return
+    Args:
+        access_token: A valid Supabase access token. If None, uses the anon key.
+        include_recent: If True, also include sessions that ended in the last hour.
+    """
+    import aiohttp
 
+    token = access_token or SUPABASE_ANON_KEY
+    if not token:
+        return []
+
+    # Build query: active sessions + optionally recent ones
+    if include_recent:
+        # All sessions from the last 60 minutes, sorted by most recent
+        url = (
+            f"{SUPABASE_URL}/rest/v1/sessions"
+            f"?order=startTime.desc&limit=50"
+        )
+    else:
+        # Only active/connected sessions
+        url = (
+            f"{SUPABASE_URL}/rest/v1/sessions"
+            f"?status=in.(active,connected)&order=startTime.desc&limit=50"
+        )
+
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status >= 400:
+                    text = await resp.text()
+                    _global_log(f"⚠️ Failed to fetch sessions: {text[:100]}")
+                    return []
+                return await resp.json()
+    except Exception as e:
+        _global_log(f"⚠️ Sessions fetch error: {e}")
+        return []
+
+
+async def _fetch_pending_requests(access_token: Optional[str] = None) -> list[dict]:
+    """Fetch pending and active support requests from Supabase."""
+    import aiohttp
+
+    token = access_token or SUPABASE_ANON_KEY
+    if not token:
+        return []
+
+    url = (
+        f"{SUPABASE_URL}/rest/v1/support_requests"
+        f"?status=in.(pending,active)&order=created_at.desc&limit=30"
+    )
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status >= 400:
+                    return []
+                return await resp.json()
+    except Exception:
+        return []
+
+
+def _format_duration(start_str: Optional[str], end_str: Optional[str] = None) -> str:
+    """Format a duration between start and now (or end) as a human-readable string."""
+    if not start_str:
+        return "—"
+    try:
+        start = datetime.fromisoformat(start_str.replace("Z", "+00:00"))
+        end = datetime.now(timezone.utc)
+        if end_str:
+            end = datetime.fromisoformat(end_str.replace("Z", "+00:00"))
+        delta = end - start
+        total_secs = int(delta.total_seconds())
+        if total_secs < 0:
+            return "—"
+        mins, secs = divmod(total_secs, 60)
+        hours, mins = divmod(mins, 60)
+        if hours > 0:
+            return f"{hours}h {mins}m {secs}s"
+        elif mins > 0:
+            return f"{mins}m {secs}s"
+        return f"{secs}s"
+    except Exception:
+        return "—"
+
+
+def _status_color(status: str) -> str:
+    """Return a Rich color for a session/request status."""
+    return {
+        "active": "green",
+        "connected": "bold green",
+        "pending": "yellow",
+        "ended": "dim",
+        "completed": "dim",
+        "cancelled": "red",
+        "failed": "red",
+    }.get(status, "white")
+
+
+async def _view_session(console):
+    """View real sessions from the Supabase database."""
+    from rich.panel import Panel
     from rich.table import Table
 
-    table = Table(title="Agents with Sessions")
-    table.add_column("#", width=4)
-    table.add_column("Name", width=18)
-    table.add_column("Last Request", width=38)
-    table.add_column("Room ID", width=38)
-    table.add_column("Accepted", justify="right", width=9)
+    console.print("  [dim]Fetching live sessions from database...[/]")
 
-    for agent in agents_with_sessions:
+    # Use the first available agent token, or fall back to anon key
+    token = None
+    for agent in _agents:
+        if agent.access_token:
+            token = agent.access_token
+            break
+
+    # Fetch both sessions and pending requests
+    sessions = await _fetch_real_sessions(token)
+    requests = await _fetch_pending_requests(token)
+
+    # Display pending/active support requests
+    if requests:
+        req_table = Table(title="Pending / Active Support Requests", show_lines=True)
+        req_table.add_column("#", style="bold", width=4)
+        req_table.add_column("Request ID", width=12)
+        req_table.add_column("User", width=18)
+        req_table.add_column("Device", width=18)
+        req_table.add_column("Status", width=10)
+        req_table.add_column("Agent", width=18)
+        req_table.add_column("Wait", width=10, justify="right")
+        req_table.add_column("Room ID", width=12)
+
+        for i, req in enumerate(requests):
+            color = _status_color(req.get("status", ""))
+            req_table.add_row(
+                str(i),
+                (req.get("id") or "—")[:12],
+                req.get("user_name") or "—",
+                req.get("device_name") or "—",
+                f"[{color}]{req.get('status', '?')}[/]",
+                req.get("accepted_agent_name") or req.get("current_agent") or "—",
+                _format_duration(req.get("created_at")),
+                (req.get("room_id") or "—")[:12],
+            )
+        console.print(req_table)
+        console.print()
+
+    # Display active sessions
+    if sessions:
+        sess_table = Table(title="Active Sessions (from DB)", show_lines=True)
+        sess_table.add_column("#", style="bold", width=4)
+        sess_table.add_column("Session ID", width=12)
+        sess_table.add_column("Device", width=20)
+        sess_table.add_column("Status", width=12)
+        sess_table.add_column("Agent", width=14)
+        sess_table.add_column("Duration", width=12, justify="right")
+        sess_table.add_column("Request ID", width=12)
+        sess_table.add_column("Device ID", width=14)
+
+        for i, sess in enumerate(sessions):
+            color = _status_color(sess.get("status", ""))
+            sess_table.add_row(
+                str(i),
+                (sess.get("sessionId") or "—")[:12],
+                sess.get("deviceName") or "—",
+                f"[{color}]{sess.get('status', '?')}[/]",
+                (sess.get("agentId") or "—")[:14],
+                _format_duration(sess.get("startTime"), sess.get("endTime")),
+                (sess.get("supportRequestId") or "—")[:12],
+                (sess.get("deviceId") or "—")[:14],
+            )
+        console.print(sess_table)
+    elif not requests:
+        console.print("  [yellow]No active sessions or pending requests found.[/]")
+        return
+
+    console.print()
+
+    # Give the user an option to inspect a session
+    if sessions:
+        choice = input("  Enter session # for details (or Enter to skip): ").strip()
+        if choice.isdigit():
+            idx = int(choice)
+            if 0 <= idx < len(sessions):
+                sess = sessions[idx]
+                detail_lines = [
+                    f"  Session ID:      {sess.get('sessionId', '—')}",
+                    f"  Device:          {sess.get('deviceName', '—')}",
+                    f"  Device ID:       {sess.get('deviceId', '—')}",
+                    f"  Status:          {sess.get('status', '—')}",
+                    f"  Agent:           {sess.get('agentId', '—')}",
+                    f"  Is Agent Sess:   {sess.get('isAgentSession', '—')}",
+                    f"  Started:         {sess.get('startTime', '—')}",
+                    f"  Duration:        {_format_duration(sess.get('startTime'), sess.get('endTime'))}",
+                    f"  Request ID:      {sess.get('supportRequestId', '—')}",
+                    f"  Recording URL:   {sess.get('recordingUrl', '—')}",
+                ]
+                console.print(Panel(
+                    "\n".join(detail_lines),
+                    title=f"Session Details: {(sess.get('sessionId') or '?')[:12]}",
+                    border_style="magenta",
+                ))
+
+                # Try to find a matching CDP browser by scanning ports
+                device_id = sess.get("deviceId", "")
+                if device_id:
+                    console.print("  [dim]Scanning for matching CDP browser...[/]")
+                    found_port = None
+                    for port in range(9300, 9350):
+                        try:
+                            import urllib.request
+                            url_check = f"http://127.0.0.1:{port}/json/list"
+                            with urllib.request.urlopen(url_check, timeout=0.3) as resp:
+                                targets = json.loads(resp.read().decode())
+                                if targets:
+                                    found_port = port
+                                    console.print(f"  [green]Found browser on port {port}[/]")
+                                    for t in targets:
+                                        console.print(f"    → {t.get('title', 'untitled')}: {t.get('url', '')[:50]}")
+                                    break
+                        except Exception:
+                            continue
+
+                    if found_port:
+                        open_it = input(f"  Open DevTools on port {found_port}? (y/n): ").strip().lower()
+                        if open_it == "y":
+                            webbrowser.open(f"http://localhost:{found_port}/json")
+                            console.print("  [green]✅ Opened in browser.[/]")
+                    else:
+                        console.print("  [dim]No active CDP browser found on ports 9300-9350.[/]")
+            else:
+                console.print(f"  [red]Invalid session #{idx}.[/]")
+
+
+async def _view_db_sessions(console):
+    """View all recent sessions from the Supabase database (including completed)."""
+    from rich.panel import Panel
+    from rich.table import Table
+
+    console.print("  [dim]Fetching all recent sessions from database...[/]")
+
+    token = None
+    for agent in _agents:
+        if agent.access_token:
+            token = agent.access_token
+            break
+
+    sessions = await _fetch_real_sessions(token, include_recent=True)
+
+    if not sessions:
+        console.print("  [yellow]No sessions found in the database.[/]")
+        return
+
+    table = Table(title=f"All Recent Sessions ({len(sessions)} found)", show_lines=True)
+    table.add_column("#", style="bold", width=4)
+    table.add_column("Session ID", width=12)
+    table.add_column("Device", width=20)
+    table.add_column("Status", width=12)
+    table.add_column("Agent", width=14)
+    table.add_column("Is Agent?", width=9, justify="center")
+    table.add_column("Duration", width=12, justify="right")
+    table.add_column("Started", width=20)
+    table.add_column("Request ID", width=12)
+
+    for i, sess in enumerate(sessions):
+        color = _status_color(sess.get("status", ""))
+        start_time = sess.get("startTime", "")
+        try:
+            start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+            start_fmt = start_dt.strftime("%H:%M:%S %d/%m")
+        except Exception:
+            start_fmt = start_time[:19] if start_time else "—"
+
         table.add_row(
-            str(agent.index),
-            agent.name,
-            agent.last_accepted_request or "—",
-            agent.last_accepted_room or "—",
-            str(agent.accepted_count),
+            str(i),
+            (sess.get("sessionId") or "—")[:12],
+            sess.get("deviceName") or "—",
+            f"[{color}]{sess.get('status', '?')}[/]",
+            (sess.get("agentId") or "—")[:14],
+            "✅" if sess.get("isAgentSession") else "—",
+            _format_duration(sess.get("startTime"), sess.get("endTime")),
+            start_fmt,
+            (sess.get("supportRequestId") or "—")[:12],
         )
 
     console.print(table)
+
+    # Summary stats
+    active_count = sum(1 for s in sessions if s.get("status") in ("active", "connected"))
+    ended_count = sum(1 for s in sessions if s.get("status") in ("ended", "completed"))
     console.print()
-
-    choice = input("  Enter agent # to view session (or Enter to skip): ").strip()
-    if not choice.isdigit():
-        return
-
-    idx = int(choice)
-    matching = [a for a in agents_with_sessions if a.index == idx]
-    if not matching:
-        console.print(f"  [red]Agent #{idx} not found.[/]")
-        return
-
-    agent = matching[0]
-
-    # Try to find the debug port of the browser that made this request
-    # by checking the support_requests table for the room_id
-    # and looking for the browser's CDP endpoint
-    if agent.last_accepted_room:
-        # The room_id corresponds to a browser's debug port
-        # We try to find the browser that generated this request
-        console.print(f"  [cyan]Opening session viewer for {agent.name}...[/]")
-        console.print(f"  Room: {agent.last_accepted_room}")
-        console.print(f"  Request: {agent.last_accepted_request}")
-
-        # Check Supabase for session details
-        console.print()
-        console.print("  [dim]Looking for CDP endpoints from active browsers...[/]")
-
-        # Try common debug ports from the browser stress test
-        found_port = None
-        for port in range(9300, 9350):
-            try:
-                import urllib.request
-                url = f"http://127.0.0.1:{port}/json/list"
-                with urllib.request.urlopen(url, timeout=0.5) as resp:
-                    targets = json.loads(resp.read().decode())
-                    if targets:
-                        found_port = port
-                        console.print(f"  [green]Found browser on port {port} with {len(targets)} target(s)[/]")
-                        for t in targets:
-                            console.print(f"    → {t.get('title', 'untitled')}: {t.get('url', '')[:60]}")
-                        break
-            except Exception:
-                continue
-
-        if found_port:
-            devtools_url = f"http://127.0.0.1:{found_port}"
-            console.print(f"\n  [bold]DevTools URL: {devtools_url}[/]")
-            console.print("  [dim]Opening in browser...[/]")
-            webbrowser.open(f"http://localhost:{found_port}/json")
-            console.print("  [green]✅ Opened in browser.[/]")
-        else:
-            console.print("  [yellow]No active browser CDP endpoints found (are browser clients running?).[/]")
-            console.print(f"  [dim]Tip: Run stress_browser_clients.py in another terminal first.[/]")
-    else:
-        console.print("  [yellow]No room ID for this agent's session.[/]")
+    console.print(
+        f"  Active: [green]{active_count}[/]  |  "
+        f"Ended: [dim]{ended_count}[/]  |  "
+        f"Total: [bold]{len(sessions)}[/]"
+    )
 
 
 async def _interactive_loop():
@@ -629,7 +851,7 @@ async def _interactive_loop():
             _view_logs(console)
 
         elif choice == "4":
-            _view_session(console)
+            await _view_session(console)
 
         elif choice == "5":
             console.print("  [yellow]Cleaning up test agents...[/]")
@@ -637,6 +859,9 @@ async def _interactive_loop():
             cleaned = await _cleanup_agents()
             console.print(f"  [green]Cleaned up {cleaned} agent(s) from database.[/]")
             console.print("  [dim]Note: Auth users cannot be deleted from client side.[/]")
+
+        elif choice == "6":
+            await _view_db_sessions(console)
 
         elif choice == "q":
             console.print("  [yellow]Shutting down...[/]")

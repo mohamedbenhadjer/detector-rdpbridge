@@ -274,20 +274,25 @@ async def _run_test(count: int, batch_size: int, delay: float, hold_time: float)
 
         console.print(f"[dim]── Batch {batch_idx + 1}/{n_batches} (browsers {start}–{end - 1}) ──[/]")
 
+        # Create tasks for this batch and add to all_tasks
+        # We don't await them here so they can hold in the background
         tasks = [
             asyncio.create_task(_run_browser(i, ports[i], console, hold_time))
             for i in range(start, end)
         ]
         all_tasks.extend(tasks)
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in results:
-            if isinstance(r, dict):
-                all_results.append(r)
-
         if batch_idx < n_batches - 1 and not _shutdown:
             console.print(f"  [dim]Waiting {delay}s before next batch...[/]")
             await asyncio.sleep(delay)
+
+    # Now we wait for ALL created tasks (across all batches) to finish their hold time
+    if all_tasks:
+        console.print(f"\n[dim]All {count} browsers launched. Waiting for their hold times to complete...[/]")
+        results = await asyncio.gather(*all_tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, dict):
+                all_results.append(r)
 
     t_done = time.time()
     total_seconds = t_done - t_start
