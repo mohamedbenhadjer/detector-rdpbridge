@@ -1205,6 +1205,113 @@ def _intercept_playwright():
         return context
     
     SyncBrowserType.launch_persistent_context = _patched_sync_launch_persistent
+
+    # Patch async BrowserType.launch
+    _orig_async_launch = AsyncBrowserType.launch
+    
+    async def _patched_async_launch(self, *args, **kwargs):
+        browser_name = self.name
+        
+        # Inject debug args for Chromium and capture chosen port
+        debug_port = None
+        if "args" in kwargs:
+            kwargs["args"], debug_port = _inject_debug_args(kwargs["args"], browser_name)
+        elif browser_name in ("chromium", "chrome", "msedge"):
+            kwargs["args"], debug_port = _inject_debug_args([], browser_name)
+        
+        browser = await _orig_async_launch(self, *args, **kwargs)
+        
+        # Store browser info with the actual debug port used
+        pid = _find_browser_pid(os.getpid())
+        
+        if browser_name in ("chromium", "chrome", "msedge"):
+            _browser_info[id(browser)] = {
+                "browser": browser_name,
+                "debug_port": debug_port,
+                "pid": pid
+            }
+            logger.info(f"Chromium async launched with debug port {debug_port}, PID {pid}")
+        else:
+            _browser_info[id(browser)] = {
+                "browser": "firefox" if browser_name == "firefox" else "webkit",
+                "debug_port": None,
+                "pid": pid
+            }
+        
+        # Monitor for browser close
+        try:
+            from miniagent_ws import get_support_manager
+            manager = get_support_manager()
+            if manager:
+                manager.monitor_browser_close(browser)
+        except Exception as e:
+            logger.warning(f"Failed to attach browser monitor: {e}")
+        
+        return browser
+    
+    AsyncBrowserType.launch = _patched_async_launch
+    
+    # Patch async BrowserType.launch_persistent_context
+    _orig_async_launch_persistent = AsyncBrowserType.launch_persistent_context
+    
+    async def _patched_async_launch_persistent(self, user_data_dir, *args, **kwargs):
+        browser_name = self.name
+        
+        # Inject debug args for Chromium and capture chosen port
+        debug_port = None
+        if "args" in kwargs:
+            kwargs["args"], debug_port = _inject_debug_args(kwargs["args"], browser_name)
+        elif browser_name in ("chromium", "chrome", "msedge"):
+            kwargs["args"], debug_port = _inject_debug_args([], browser_name)
+        
+        context = await _orig_async_launch_persistent(self, user_data_dir, *args, **kwargs)
+        
+        # Set debug port for Chromium (use the port we chose)
+        if browser_name in ("chromium", "chrome", "msedge"):
+            # Sanity check: read DevToolsActivePort file if available
+            import asyncio
+            await asyncio.sleep(0.5)  # Give Chrome time to write the file
+            detected_port = _read_devtools_port(Path(user_data_dir))
+            if detected_port and detected_port != debug_port:
+                logger.warning(f"DevToolsActivePort mismatch: configured={debug_port}, detected={detected_port}")
+                debug_port = detected_port
+            
+            logger.info(f"Chromium async persistent context launched with debug port {debug_port}")
+        
+        # Find browser PID
+        pid = _find_browser_pid(os.getpid())
+        
+        _browser_info[id(context)] = {
+            "browser": browser_name if browser_name in ("chromium", "firefox", "webkit") else "chromium",
+            "debug_port": debug_port,
+            "pid": pid
+        }
+        
+        # Install popup prevention on persistent context
+        _install_popup_prevention_on_context_async(context)
+        # Install on any existing pages
+        try:
+            for page in context.pages:
+                import asyncio
+                asyncio.create_task(_install_popup_prevention_on_page_async(page))
+        except Exception as e:
+            logger.debug(f"Could not install popup prevention on async persistent context pages: {e}")
+        
+        # Monitor for browser close (context)
+        try:
+            from miniagent_ws import get_support_manager
+            manager = get_support_manager()
+            if manager:
+                manager.monitor_browser_close(context)
+                # Monitor existing pages too
+                for page in context.pages:
+                    manager.monitor_page_close(page)
+        except Exception as e:
+            logger.warning(f"Failed to attach context monitor: {e}")
+
+        return context
+    
+    AsyncBrowserType.launch_persistent_context = _patched_async_launch_persistent
     
     # === Popup/Tab prevention patches ===
     
