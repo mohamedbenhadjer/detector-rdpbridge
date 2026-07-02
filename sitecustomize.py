@@ -116,33 +116,7 @@ document.addEventListener('click', (event) => {
 """
 
 
-def _find_free_debug_port(base_port: int, max_attempts: int = 50) -> int:
-    """
-    Find a free port starting from base_port by probing base_port, base_port+1, etc.
-    Returns the first free port found, or base_port if none found (with warning).
-    """
-    for offset in range(max_attempts):
-        port = base_port + offset
-        try:
-            # Try to bind to the port to check if it's free
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind(("127.0.0.1", port))
-                logger.debug(f"Found free debug port: {port}")
-                return port
-        except OSError:
-            # Port is in use, try next one
-            continue
-    
-    # If we exhausted all attempts, warn and fall back to base_port
-    logger.warning(f"Could not find free port in range {base_port}-{base_port + max_attempts - 1}, falling back to {base_port}")
-    return base_port
 
-
-    return None
-
-
-# === Process and PID Monitoring ===
 
 def _get_process_tree_linux():
     """Builds a dict of ppid -> list of child pids from /proc (Linux only)."""
@@ -267,13 +241,14 @@ def _find_browser_pid(root_pid: int):
     while queue:
         current_pid = queue.pop(0)
 
-        # Check current process
-        cmd = cmdlines.get(current_pid, "")
-        cmd_lower = cmd.lower()
-        if any(x in cmd_lower for x in ["chrome", "chromium", "msedge", "firefox", "webkit", "safari"]):
-            # Heuristic: Main process usually doesn't have --type=renderer etc.
-            # But Playwright launches wrapper scripts too.
-            candidates.append((current_pid, cmd))
+        # Check current process (skip the root process itself to avoid matching python scripts)
+        if current_pid != root_pid:
+            cmd = cmdlines.get(current_pid, "")
+            cmd_lower = cmd.lower()
+            if any(x in cmd_lower for x in ["chrome", "chromium", "msedge", "firefox", "webkit", "safari"]):
+                # Heuristic: Main process usually doesn't have --type=renderer etc.
+                # But Playwright launches wrapper scripts too.
+                candidates.append((current_pid, cmd))
 
         # Add children
         children = tree.get(current_pid, [])
@@ -579,14 +554,12 @@ def _start_resume_http_server():
         logger.error("Resume HTTP enabled but MINIAGENT_RESUME_HTTP_TOKEN is not set; not starting HTTP server")
         return
 
-    # Find a free port dynamically
-    chosen_port = _find_free_debug_port(_RESUME_HTTP_PORT_BASE)
-    _RESUME_HTTP_PORT = chosen_port
-    
     try:
-        httpd = HTTPServer((_RESUME_HTTP_HOST, _RESUME_HTTP_PORT), _ResumeRequestHandler)
+        # Pass 0 to let the OS pick a free port, avoiding TOCTOU race conditions
+        httpd = HTTPServer((_RESUME_HTTP_HOST, 0), _ResumeRequestHandler)
+        _RESUME_HTTP_PORT = httpd.server_port
     except Exception as e:
-        logger.warning(f"Resume HTTP: failed to bind {_RESUME_HTTP_HOST}:{_RESUME_HTTP_PORT}: {e}")
+        logger.warning(f"Resume HTTP: failed to bind {_RESUME_HTTP_HOST}:0: {e}")
         return
 
     th = threading.Thread(target=httpd.serve_forever, name="miniagent-resume-http", daemon=True)
