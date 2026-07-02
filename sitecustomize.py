@@ -41,6 +41,15 @@ if not logger.handlers:
 # Track if we've already patched
 _patched = False
 
+# Track browser info per launch
+_browser_info: Dict[int, Dict[str, Any]] = {}
+
+# Track last active page to provide context for global errors
+_last_active_page_ref = None
+
+# Track last failure selectors to provide context when NeedsAgentInterventionError is raised manually
+_last_failure_selectors = (None, None)
+
 # Error handling mode configuration
 _MODE = os.environ.get("MINIAGENT_ON_ERROR", "report").lower()  # report|hold|swallow
 _HOLD_RAW = os.environ.get("MINIAGENT_HOLD_SECS", "").strip().lower()
@@ -373,11 +382,11 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
                 logger.info("Resume signal detected; continuing.")
                 try:
                     Path(_RESUME_FILE).unlink(missing_ok=True)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"Error removing resume file: {e}")
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Error checking resume file: {e}")
             
         # Check if request was cancelled (e.g. by signal or browser close callback)
         if manager and not manager.active_request_id:
@@ -415,9 +424,9 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
                 # We removed the active polling for cancellation here because monitor_page_close
                 # should handle it via event. But we can keep a passive check if needed.
                 pass
-            except Exception:
-                pass
-        
+            except Exception as e:
+                logger.debug(f"Error checking browser/page state: {e}")
+
         # Check if browser is disconnected (secondary check)
         if browser_or_context:
             try:
@@ -432,9 +441,9 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
                          if manager:
                              manager.cancel_support_request("browser_closed")
                          sys.exit(1)
-            except Exception:
-                pass
-                
+            except Exception as e:
+                logger.debug(f"Error checking browser disconnect state: {e}")
+
         # Check if WS is disconnected for too long (60s grace period)
         if manager and hasattr(manager, 'ws_client') and manager.ws_client:
             if not getattr(manager.ws_client, 'connected', True):
@@ -454,9 +463,9 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
             try:
                 page_obj.wait_for_timeout(1000)
                 did_wait = True
-            except Exception:
+            except Exception as e:
                 # Page might be closed or error during wait
-                pass
+                logger.debug(f"Error during wait_for_timeout: {e}")
         
         if not did_wait:
             time.sleep(1.0)
@@ -844,6 +853,68 @@ def _install_popup_prevention_on_context_async(context_obj):
         logger.warning(f"Failed to configure popup prevention on async context: {e}")
 
 
+def _get_support_context(page_obj=None) -> Dict[str, Any]:
+    """
+    Get context for support request (browser, page info, CDP target, etc.).
+    Uses provided page_obj or falls back to last active page.
+    """
+    global _last_active_page_ref
+    
+    # Resolve page object
+    if not page_obj and _last_active_page_ref:
+        try:
+            page_obj = _last_active_page_ref()
+        except:
+            pass
+    
+    # Extract page info
+    page_info = _get_page_info(page_obj) if page_obj else {}
+    
+    # Get browser info
+    browser_info = {"browser": "chromium", "debug_port": None}
+    try:
+        if page_obj and hasattr(page_obj, "context"):
+            ctx = page_obj.context
+            # Try via Browser → mapping
+            if hasattr(ctx, "browser") and ctx.browser and id(ctx.browser) in _browser_info:
+                browser_info = _browser_info[id(ctx.browser)]
+            # Persistent context path stores mapping by context id
+            elif id(ctx) in _browser_info:
+                browser_info = _browser_info[id(ctx)]
+        # Fallback: detect browser type off the object if needed
+        elif page_obj and hasattr(page_obj, "_impl") and hasattr(page_obj._impl, "_browser_type"):
+            bt_name = page_obj._impl._browser_type.name
+            browser_info["browser"] = bt_name if bt_name in ("firefox", "webkit") else "chromium"
+            browser_info["pid"] = None # Can't easily determine pid in fallback
+    except Exception:
+        pass
+    
+    # Try to resolve CDP Target ID for Chromium browsers
+    cdp_target_id = None
+    if browser_info.get("debug_port") and page_info.get("url"):
+        cdp_target_id = _get_cdp_target_id(browser_info["debug_port"], page_info["url"])
+    
+    # Build resume endpoint info if HTTP resume is enabled
+    resume_endpoint = None
+    if _RESUME_HTTP_ENABLED and _RESUME_HTTP_TOKEN:
+        resume_endpoint = {
+            "scheme": "http",
+            "host": _RESUME_HTTP_HOST,
+            "port": _RESUME_HTTP_PORT,
+            "path": "/resume",
+            "token": _RESUME_HTTP_TOKEN
+        }
+        
+    return {
+        "browser": browser_info["browser"],
+        "pid": browser_info.get("pid"),
+        "debug_port": browser_info.get("debug_port"),
+        "url": page_info.get("url"),
+        "title": page_info.get("title"),
+        "page_id": page_info.get("page_id"),
+        "resume_endpoint": resume_endpoint,
+        "cdp_target_id": cdp_target_id
+    }
 def _intercept_playwright():
     """Monkey-patch Playwright to intercept errors and inject debug flags."""
     global _patched
@@ -957,10 +1028,7 @@ def _intercept_playwright():
         logger.debug("Registered signal handlers for cancellation")
     except Exception as e:
         logger.warning(f"Failed to register signal handlers: {e}")
-    
-    # Track browser info per launch
-    _browser_info: Dict[int, Dict[str, Any]] = {}
-    
+
     # === Chromium debug port injection ===
     
     def _inject_debug_args(args: list, browser_name: str) -> tuple:
@@ -1290,78 +1358,9 @@ def _intercept_playwright():
         logger.debug("Patched async Browser.new_page for popup prevention, resizing and monitoring")
     
     # === Error interception ===
-    
-    # Track last active page to provide context for global errors
+
     import weakref
-    global _last_active_page_ref
-    _last_active_page_ref = None
     
-    # Track last failure selectors to provide context when NeedsAgentInterventionError is raised manually
-    global _last_failure_selectors
-    _last_failure_selectors = (None, None)
-    
-    def _get_support_context(page_obj=None) -> Dict[str, Any]:
-        """
-        Get context for support request (browser, page info, CDP target, etc.).
-        Uses provided page_obj or falls back to last active page.
-        """
-        global _last_active_page_ref
-        
-        # Resolve page object
-        if not page_obj and _last_active_page_ref:
-            try:
-                page_obj = _last_active_page_ref()
-            except:
-                pass
-        
-        # Extract page info
-        page_info = _get_page_info(page_obj) if page_obj else {}
-        
-        # Get browser info
-        browser_info = {"browser": "chromium", "debug_port": None}
-        try:
-            if page_obj and hasattr(page_obj, "context"):
-                ctx = page_obj.context
-                # Try via Browser → mapping
-                if hasattr(ctx, "browser") and ctx.browser and id(ctx.browser) in _browser_info:
-                    browser_info = _browser_info[id(ctx.browser)]
-                # Persistent context path stores mapping by context id
-                elif id(ctx) in _browser_info:
-                    browser_info = _browser_info[id(ctx)]
-            # Fallback: detect browser type off the object if needed
-            elif page_obj and hasattr(page_obj, "_impl") and hasattr(page_obj._impl, "_browser_type"):
-                bt_name = page_obj._impl._browser_type.name
-                browser_info["browser"] = bt_name if bt_name in ("firefox", "webkit") else "chromium"
-                browser_info["pid"] = None # Can't easily determine pid in fallback
-        except Exception:
-            pass
-        
-        # Try to resolve CDP Target ID for Chromium browsers
-        cdp_target_id = None
-        if browser_info.get("debug_port") and page_info.get("url"):
-            cdp_target_id = _get_cdp_target_id(browser_info["debug_port"], page_info["url"])
-        
-        # Build resume endpoint info if HTTP resume is enabled
-        resume_endpoint = None
-        if _RESUME_HTTP_ENABLED and _RESUME_HTTP_TOKEN:
-            resume_endpoint = {
-                "scheme": "http",
-                "host": _RESUME_HTTP_HOST,
-                "port": _RESUME_HTTP_PORT,
-                "path": "/resume",
-                "token": _RESUME_HTTP_TOKEN
-            }
-            
-        return {
-            "browser": browser_info["browser"],
-            "pid": browser_info.get("pid"),
-            "debug_port": browser_info.get("debug_port"),
-            "url": page_info.get("url"),
-            "title": page_info.get("title"),
-            "page_id": page_info.get("page_id"),
-            "resume_endpoint": resume_endpoint,
-            "cdp_target_id": cdp_target_id
-        }
     
     def _wrap_method(cls, method_name: str, is_async: bool = False):
         """Wrap a method to catch and report Playwright exceptions."""
@@ -1648,8 +1647,8 @@ def _handle_exception(exc_type, exc_value, exc_traceback):
                     if _last_active_page_ref:
                         try:
                             page_obj = _last_active_page_ref()
-                        except:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"Error resolving last active page reference: {e}")
                             
                     _park_until_resume(exc_type.__name__, str(exc_value), page_obj)
                     # Don't call original excepthook - we handled it
