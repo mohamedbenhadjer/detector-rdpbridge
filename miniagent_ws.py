@@ -131,6 +131,7 @@ class MiniAgentWSClient:
                         logger.info(f"Request {run_id} is {status}, cancelling locally.")
                         with _support_manager.active_request_lock:
                             _support_manager.active_request_id = None
+                            _support_manager.active_page_id = None
 
             elif msg_type == "support_request_ack":
                 request_id = data.get("requestId")
@@ -275,6 +276,7 @@ class SupportRequestManager:
         
         # Track active request for cancellation
         self.active_request_id: Optional[str] = None
+        self.active_page_id: Optional[str] = None
         self.active_request_lock = threading.Lock()
         
         self._setup_signal_handlers()
@@ -321,14 +323,15 @@ class SupportRequestManager:
         """
         Attach a listener to the Playwright page to cancel the request
         if the page is closed.
-        
+
         Args:
             page: The Playwright Page instance.
         """
+        page_id = str(id(page))
         def on_close(p):
-            logger.info("Page closed, cancelling active support request...")
-            self.cancel_support_request("page_closed")
-            
+            logger.info(f"Page closed, checking if active support request should be cancelled... (page_id: {page_id})")
+            self.cancel_support_request("page_closed", page_id=page_id)
+
         page.on("close", on_close)
     
     def trigger_support_request(
@@ -417,26 +420,33 @@ class SupportRequestManager:
         
         with self.active_request_lock:
             self.active_request_id = self.run_id
-            
+            self.active_page_id = page_id
+
         self.ws_client.send_support_request(payload)
 
-    def cancel_support_request(self, reason: str):
+    def cancel_support_request(self, reason: str, page_id: Optional[str] = None):
         """
         Cancel the current active support request if any.
         """
         with self.active_request_lock:
             if not self.active_request_id:
                 return
-            
+
+            if page_id is not None and self.active_page_id is not None:
+                if page_id != self.active_page_id:
+                    logger.debug(f"Ignoring cancel request from page {page_id} because active page is {self.active_page_id}")
+                    return
+
             # Send cancellation
             payload = {
                 "runId": self.active_request_id,
                 "reason": reason,
                 "ts": datetime.now(timezone.utc).isoformat()
             }
-            
+
             self.ws_client.send_support_cancelled(payload)
             self.active_request_id = None
+            self.active_page_id = None
 
 
 # Global singleton instances
