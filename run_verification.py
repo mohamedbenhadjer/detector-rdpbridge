@@ -56,7 +56,7 @@ def main():
     time.sleep(2)
     
     # Use myenv python
-    python_exe = os.path.join(os.getcwd(), "myenv", "bin", "python")
+    python_exe = os.path.join(os.getcwd(), "venv", "bin", "python")
     
     # Run the playwright script with a custom behavior
     # We want to simulate successful resumption and then a random exit
