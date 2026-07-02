@@ -28,7 +28,39 @@ if not _IS_MINIAGENT_ENABLED:
 # Define specific error for agent intervention
 class NeedsAgentInterventionError(Exception):
     """Error raised when a Playwright script needs human/agent intervention."""
-    pass
+    def __init__(self, message, page_obj=None, success_selector=None, failure_selector=None):
+        super().__init__(message)
+        self.page_obj = page_obj
+        self.success_selector = success_selector
+        self.failure_selector = failure_selector
+
+        # If not provided, try to extract from the exception being handled
+        import sys
+        import inspect
+        exc = sys.exc_info()[1]
+        if exc:
+            if not self.page_obj:
+                self.page_obj = getattr(exc, "_miniagent_page_obj", None)
+            if not self.success_selector:
+                self.success_selector = getattr(exc, "_miniagent_success_selector", None)
+            if not self.failure_selector:
+                self.failure_selector = getattr(exc, "_miniagent_failure_selector", None)
+
+        # If still no page_obj, look up the stack for a variable that looks like a page
+        if not self.page_obj:
+            try:
+                for frame_info in inspect.stack():
+                    local_vars = frame_info.frame.f_locals
+                    for name in ['page_obj', 'page', 'p']:
+                        if name in local_vars:
+                            val = local_vars[name]
+                            if hasattr(val, 'context'):
+                                self.page_obj = val
+                                break
+                    if self.page_obj:
+                        break
+            except Exception:
+                pass
 
 # Inject into builtins so it's available globally without import
 import builtins
@@ -46,12 +78,6 @@ _patched = False
 
 # Track browser info per launch
 _browser_info: Dict[int, Dict[str, Any]] = {}
-
-# Track last active page to provide context for global errors
-_last_active_page_ref = None
-
-# Track last failure selectors to provide context when NeedsAgentInterventionError is raised manually
-_last_failure_selectors = (None, None)
 
 # Error handling mode configuration
 _MODE = os.environ.get("MINIAGENT_ON_ERROR", "report").lower()  # report|hold|swallow
@@ -331,15 +357,6 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
     
     # Try to resolve browser/context from page_obj if possible
     browser_or_context = None
-    
-    # Fallback to last active page if not provided
-    if not page_obj:
-        try:
-            global _last_active_page_ref
-            if _last_active_page_ref:
-                page_obj = _last_active_page_ref()
-        except:
-            pass
 
     if page_obj:
         try:
@@ -834,17 +851,8 @@ def _install_popup_prevention_on_context_async(context_obj):
 def _get_support_context(page_obj=None) -> Dict[str, Any]:
     """
     Get context for support request (browser, page info, CDP target, etc.).
-    Uses provided page_obj or falls back to last active page.
+    Uses provided page_obj.
     """
-    global _last_active_page_ref
-    
-    # Resolve page object
-    if not page_obj and _last_active_page_ref:
-        try:
-            page_obj = _last_active_page_ref()
-        except:
-            pass
-    
     # Extract page info
     page_info = _get_page_info(page_obj) if page_obj else {}
     
@@ -944,13 +952,13 @@ def _intercept_playwright():
                     if not getattr(exc_val, "_miniagent_handled", False):
                         logger.info(f"Caught NeedsAgentInterventionError in Playwright context: {exc_val}")
                         
-                        # Get context from last active page
-                        ctx = _get_support_context()
-                        
-                        # Use last failure selectors if available
-                        global _last_failure_selectors
-                        success_selector, failure_selector = _last_failure_selectors
-                        
+                        # Get context from the exception's page object
+                        page_obj = getattr(exc_val, "page_obj", None)
+                        ctx = _get_support_context(page_obj)
+
+                        success_selector = getattr(exc_val, "success_selector", None)
+                        failure_selector = getattr(exc_val, "failure_selector", None)
+
                         # Trigger support request
                         manager.trigger_support_request(
                             reason=exc_type.__name__,
@@ -970,11 +978,11 @@ def _intercept_playwright():
                         if _MODE == "hold":
                             logger.warning(f"Holding on error - browser will stay open. Resume file: {_RESUME_FILE}")
                             # Resolve page object if available from context
-                            page_obj = None
-                            if hasattr(exc_val, "page"):
-                                page_obj = exc_val.page
-                            
-                            _park_until_resume(exc_type.__name__, str(exc_val), page_obj)
+                            p_obj = getattr(exc_val, "page_obj", None)
+                            if not p_obj and hasattr(exc_val, "page"):
+                                p_obj = exc_val.page
+
+                            _park_until_resume(exc_type.__name__, str(exc_val), p_obj)
                             # After resume, suppress the exception and continue
                             return True  # Suppress exception
                         elif _MODE == "swallow":
@@ -1507,36 +1515,28 @@ def _intercept_playwright():
         
         def _sync_wrapper(self, *args, **kwargs):
             try:
-                # Resolve page object from Page or Locator
-                page_obj = _resolve_page_obj(self)
-                
-                # Update last active page
-                if page_obj:
-                    global _last_active_page_ref
-                    try:
-                        _last_active_page_ref = weakref.ref(page_obj)
-                    except:
-                        pass
-                
                 return orig_method(self, *args, **kwargs)
             except (PlaywrightTimeoutError, PlaywrightError, AssertionError, NeedsAgentInterventionError) as e:
-                # Resolve page object again (in case it wasn't resolved before)
+                # Resolve page object
                 page_obj = _resolve_page_obj(self)
-                
+
                 # Get context using helper
                 ctx = _get_support_context(page_obj)
-                
+
                 # Determine error type
                 error_type = type(e).__name__
                 error_msg = str(e)[:200]
-                
+
                 # Extract detection selectors
                 success_selector, failure_selector = _extract_detection_selectors(method_name, self, args, kwargs)
-                
-                # Store selectors for global error handling (in case user catches this and raises NeedsAgentInterventionError)
-                if success_selector or failure_selector:
-                    global _last_failure_selectors
-                    _last_failure_selectors = (success_selector, failure_selector)
+
+                # Attach context to the exception so that if caught and wrapped in NeedsAgentInterventionError, it inherits it
+                try:
+                    e._miniagent_page_obj = page_obj
+                    e._miniagent_success_selector = success_selector
+                    e._miniagent_failure_selector = failure_selector
+                except Exception:
+                    pass
                 
                 # Build details string including selectors for human readability
                 details = f"{method_name}: {error_msg}"
@@ -1579,35 +1579,27 @@ def _intercept_playwright():
         
         async def _async_wrapper(self, *args, **kwargs):
             try:
-                # Resolve page object from Page or Locator
-                page_obj = _resolve_page_obj(self)
-                
-                # Update last active page
-                if page_obj:
-                    global _last_active_page_ref
-                    try:
-                        _last_active_page_ref = weakref.ref(page_obj)
-                    except:
-                        pass
-
                 return await orig_method(self, *args, **kwargs)
             except (PlaywrightTimeoutError, PlaywrightError, AssertionError, NeedsAgentInterventionError) as e:
-                # Resolve page object again
+                # Resolve page object
                 page_obj = _resolve_page_obj(self)
-                
+
                 # Get context using helper
                 ctx = _get_support_context(page_obj)
-                
+
                 error_type = type(e).__name__
                 error_msg = str(e)[:200]
-                
+
                 # Extract detection selectors
                 success_selector, failure_selector = _extract_detection_selectors(method_name, self, args, kwargs)
-                
-                # Store selectors for global error handling (in case user catches this and raises NeedsAgentInterventionError)
-                if success_selector or failure_selector:
-                    global _last_failure_selectors
-                    _last_failure_selectors = (success_selector, failure_selector)
+
+                # Attach context to the exception
+                try:
+                    e._miniagent_page_obj = page_obj
+                    e._miniagent_success_selector = success_selector
+                    e._miniagent_failure_selector = failure_selector
+                except Exception:
+                    pass
                 
                 # Build details string including selectors for human readability
                 details = f"{method_name}: {error_msg}"
@@ -1728,13 +1720,24 @@ def _handle_exception(exc_type, exc_value, exc_traceback):
             from miniagent_ws import get_support_manager
             manager = get_support_manager()
             if manager:
-                # Get context from last active page
-                ctx = _get_support_context()
-                
-                # Use last failure selectors if available
-                global _last_failure_selectors
-                success_selector, failure_selector = _last_failure_selectors
-                
+                # Get context from page object on exception or traceback
+                page_obj = getattr(exc_value, "page_obj", None)
+                if not page_obj:
+                    tb = exc_traceback
+                    while tb:
+                        if 'page' in tb.tb_frame.f_locals:
+                            page_obj = tb.tb_frame.f_locals['page']
+                            break
+                        elif 'page_obj' in tb.tb_frame.f_locals:
+                            page_obj = tb.tb_frame.f_locals['page_obj']
+                            break
+                        tb = tb.tb_next
+
+                ctx = _get_support_context(page_obj)
+
+                success_selector = getattr(exc_value, "success_selector", None)
+                failure_selector = getattr(exc_value, "failure_selector", None)
+
                 manager.trigger_support_request(
                     reason=exc_type.__name__,
                     details=str(exc_value),
@@ -1748,17 +1751,9 @@ def _handle_exception(exc_type, exc_value, exc_traceback):
                     failure_selector=failure_selector,
                     cdp_target_id=ctx["cdp_target_id"]
                 )
-                
+
                 # Handle based on mode (hold/swallow for NeedsAgentInterventionError)
                 if _MODE == "hold":
-                    # Get page_obj from weakref if possible
-                    page_obj = None
-                    if _last_active_page_ref:
-                        try:
-                            page_obj = _last_active_page_ref()
-                        except Exception as e:
-                            logger.debug(f"Error resolving last active page reference: {e}")
-                            
                     _park_until_resume(exc_type.__name__, str(exc_value), page_obj)
                     # Don't call original excepthook - we handled it
                     return
