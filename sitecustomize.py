@@ -144,108 +144,149 @@ document.addEventListener('click', (event) => {
 
 
 
-def _get_process_tree_linux():
-    """Builds a dict of ppid -> list of child pids from /proc (Linux only)."""
+def _get_process_tree_posix():
+    """Builds a dict of ppid -> list of child pids from /proc (Linux) or ps (macOS)."""
     tree = {}
     cmdlines = {}
-    try:
-        # PIDs are directories in /proc that are all digits
-        pids = [pid for pid in os.listdir('/proc') if pid.isdigit()]
-        for pid_str in pids:
-            try:
-                pid = int(pid_str)
-                # Read ppid from /proc/pid/stat
-                with open(f'/proc/{pid}/stat', 'r') as f:
-                    stat = f.read().strip()
-                    # stat format: pid (comm) state ppid ...
-                    # We skip 'comm' because it can contain spaces and parens.
-                    # reliably finding the last ')' is the standard way.
-                    r_paren = stat.rfind(')')
-                    if r_paren == -1: continue
-                    
-                    rest = stat[r_paren+1:].split()
-                    if len(rest) > 1:
-                        ppid = int(rest[1])
-                        if ppid not in tree:
-                            tree[ppid] = []
-                        tree[ppid].append(pid)
-                
-                # Read cmdline from /proc/pid/cmdline
+
+    # Try /proc first (fastest on Linux)
+    if os.path.exists('/proc'):
+        try:
+            # PIDs are directories in /proc that are all digits
+            pids = [pid for pid in os.listdir('/proc') if pid.isdigit()]
+            for pid_str in pids:
                 try:
-                    with open(f'/proc/{pid}/cmdline', 'r') as f:
-                        # Cmdline arguments are null-separated
-                        cmd = f.read().replace('\0', ' ').strip()
-                        cmdlines[pid] = cmd
-                except:
-                    cmdlines[pid] = ""
-                    
-            except (FileNotFoundError, PermissionError, ValueError):
+                    pid = int(pid_str)
+                    # Read ppid from /proc/pid/stat
+                    with open(f'/proc/{pid}/stat', 'r') as f:
+                        stat = f.read().strip()
+                        r_paren = stat.rfind(')')
+                        if r_paren == -1: continue
+
+                        rest = stat[r_paren+1:].split()
+                        if len(rest) > 1:
+                            ppid = int(rest[1])
+                            if ppid not in tree:
+                                tree[ppid] = []
+                            tree[ppid].append(pid)
+
+                    # Read cmdline from /proc/pid/cmdline
+                    try:
+                        with open(f'/proc/{pid}/cmdline', 'r') as f:
+                            # Cmdline arguments are null-separated
+                            cmd = f.read().replace('\0', ' ').strip()
+                            cmdlines[pid] = cmd
+                    except:
+                        cmdlines[pid] = ""
+
+                except (FileNotFoundError, PermissionError, ValueError):
+                    continue
+            return tree, cmdlines
+        except Exception as e:
+            logger.debug(f"Error scanning /proc: {e}")
+
+    # Fallback for macOS (Darwin) or if /proc failed
+    try:
+        import subprocess
+        output = subprocess.check_output(['ps', '-eo', 'pid=,ppid=,args='], text=True)
+        for line in output.splitlines():
+            line = line.strip()
+            if not line:
                 continue
+            parts = line.split(maxsplit=2)
+            if len(parts) >= 2:
+                try:
+                    pid = int(parts[0])
+                    ppid = int(parts[1])
+                    cmd = parts[2] if len(parts) > 2 else ""
+
+                    if ppid not in tree:
+                        tree[ppid] = []
+                    tree[ppid].append(pid)
+
+                    cmdlines[pid] = cmd
+                except ValueError:
+                    continue
     except Exception as e:
-        logger.debug(f"Error scanning /proc: {e}")
-        
+        logger.debug(f"Error running ps command: {e}")
+
     return tree, cmdlines
 
 def _get_process_tree_windows():
-    """Builds a process tree using wmic (Windows only)."""
+    """Builds a process tree using PowerShell or wmic (Windows only)."""
     tree = {}
     cmdlines = {}
     try:
         import subprocess
-        # Get ProcessId, ParentProcessId, CommandLine
-        cmd = 'wmic process get ProcessId,ParentProcessId,CommandLine /FORMAT:csv'
-        # Run wmic, suppress window creation on Windows if needed (startupinfo)
+        import csv
+        import io
+
         startupinfo = None
         if os.name == 'nt':
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
-        output = subprocess.check_output(cmd, shell=True, startupinfo=startupinfo, text=True)
-        
+
+        # Try PowerShell first (Get-CimInstance is supported on modern Windows, unlike deprecated wmic)
+        cmd_pwsh = 'powershell -NoProfile -Command "Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, CommandLine | ConvertTo-Csv -NoTypeInformation"'
+        try:
+            output = subprocess.check_output(cmd_pwsh, shell=True, startupinfo=startupinfo, text=True)
+            reader = csv.DictReader(io.StringIO(output.strip()))
+            for row in reader:
+                try:
+                    pid = int(row.get('ProcessId', 0))
+                    ppid = int(row.get('ParentProcessId', 0))
+                    cmd = row.get('CommandLine', '') or ""
+
+                    if ppid not in tree:
+                        tree[ppid] = []
+                    tree[ppid].append(pid)
+                    cmdlines[pid] = cmd
+                except ValueError:
+                    continue
+            if tree:
+                return tree, cmdlines
+        except Exception as e:
+            logger.debug(f"Error checking processes via PowerShell: {e}")
+
+        # Fallback to wmic if PowerShell fails
+        cmd_wmic = 'wmic process get ProcessId,ParentProcessId,CommandLine /FORMAT:csv'
+        output = subprocess.check_output(cmd_wmic, shell=True, startupinfo=startupinfo, text=True)
+
         lines = output.strip().splitlines()
         # First line is blank or headers. CSV format: Node,CommandLine,ParentProcessId,ProcessId
-        # Headers: Node,CommandLine,ParentProcessId,ProcessId
-        
+
         for line in lines:
             if not line.strip(): continue
             parts = line.split(',')
             if len(parts) < 4: continue
-            
+
             # Skip header
             if "ProcessId" in parts[-1] and "ParentProcessId" in parts[-2]:
                 continue
-                
+
             try:
                 # WMIC CSV sometimes puts the value at the end
-                # Format: Node, CommandLine, ParentProcessId, ProcessId
                 pid = int(parts[-1])
                 ppid = int(parts[-2])
-                cmd = parts[1] # This might be truncated if it contains commas? 
-                # Actually wmic CSV output is tricky with commas in values.
-                # But typically CommandLine is the big string.
-                # Let's hope basic split works, or we might need robust CSV parsing.
-                # For basic browsing detection, "chrome.exe" usually appears even if split is wrong.
-                
+                cmd = parts[1] # This might be truncated if it contains commas
+
                 if ppid not in tree:
                     tree[ppid] = []
                 tree[ppid].append(pid)
-                
+
                 cmdlines[pid] = cmd
             except ValueError:
                 continue
-                
+
     except Exception as e:
         logger.debug(f"Error checking processes via wmic: {e}")
-        
+
     return tree, cmdlines
 
 def _get_process_tree():
     """Get process tree for current OS."""
     if os.name == 'posix':
-        # Linux/Mac (though Mac /proc is different/non-existent, we assume Linux based on env)
-        # If Mac, this would likely fail empty or need psutil. 
-        # But User says Linux.
-        return _get_process_tree_linux()
+        return _get_process_tree_posix()
     else:
         return _get_process_tree_windows()
 
