@@ -364,6 +364,10 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
     
     
     while True:
+        if deadline and time.time() > deadline:
+            logger.info("Hold deadline exceeded, resuming")
+            return
+
         try:
             if _RESUME_FILE and Path(_RESUME_FILE).exists():
                 logger.info("Resume signal detected; continuing.")
