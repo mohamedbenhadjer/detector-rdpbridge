@@ -114,8 +114,24 @@ class MiniAgentWSClient:
                 logger.info("Handshake complete - Client Authenticated")
                 self.authenticated = True
                 self.reconnect_delay = 0.5  # Reset backoff on success
+
+                # Check for active request and verify its status
+                global _support_manager
+                if _support_manager and _support_manager.active_request_id:
+                    self.send_status_check(_support_manager.active_request_id)
+
                 self._flush_pending()
-            
+
+            elif msg_type == "status_result":
+                run_id = data.get("runId")
+                status = data.get("status")
+                logger.info(f"Status check result for {run_id}: {status}")
+                if status in ["completed", "failed", "cancelled", "noAgents", "error", "unknown"]:
+                    if _support_manager and _support_manager.active_request_id == run_id:
+                        logger.info(f"Request {run_id} is {status}, cancelling locally.")
+                        with _support_manager.active_request_lock:
+                            _support_manager.active_request_id = None
+
             elif msg_type == "support_request_ack":
                 request_id = data.get("requestId")
                 room_id = data.get("roomId")
@@ -172,6 +188,25 @@ class MiniAgentWSClient:
                     self.pending_messages.insert(0, msg)
                     break
     
+    def send_status_check(self, run_id: str):
+        """Send a status check request to the server."""
+        msg = {
+            "type": "status_check",
+            "runId": run_id
+        }
+
+        with self.lock:
+            if self.authenticated and self.ws:
+                try:
+                    self.ws.send(json.dumps(msg))
+                    logger.debug(f"Sent status check for runId: {run_id}")
+                except Exception as e:
+                    logger.error(f"Failed to send status check: {e}")
+                    self.pending_messages.append(msg)
+            else:
+                logger.debug("Not authenticated yet, buffering status check")
+                self.pending_messages.append(msg)
+
     def send_support_request(self, payload: Dict[str, Any]):
         """
         Send a support request to the Flutter server.

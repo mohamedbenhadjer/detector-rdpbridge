@@ -431,6 +431,19 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
             except Exception:
                 pass
                 
+        # Check if WS is disconnected for too long (60s grace period)
+        if manager and hasattr(manager, 'ws_client') and manager.ws_client:
+            if not getattr(manager.ws_client, 'connected', True):
+                if not hasattr(manager, '_disconnect_start_time') or manager._disconnect_start_time is None:
+                    manager._disconnect_start_time = time.time()
+                elif time.time() - manager._disconnect_start_time > 60.0:
+                    logger.info("WebSocket disconnected for over 60s; exiting hold.")
+                    with manager.active_request_lock:
+                        manager.active_request_id = None
+                    sys.exit(1)
+            else:
+                manager._disconnect_start_time = None
+
         # Use wait_for_timeout if possible to spin event loop
         did_wait = False
         if page_obj and hasattr(page_obj, "wait_for_timeout"):
