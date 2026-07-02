@@ -19,8 +19,11 @@ from typing import Optional, Any, Dict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Only activate if explicitly enabled
-if os.environ.get("MINIAGENT_ENABLED", "1") != "1":
-    sys.exit(0)
+_IS_MINIAGENT_ENABLED = os.environ.get("MINIAGENT_ENABLED", "1") == "1"
+if not _IS_MINIAGENT_ENABLED:
+    # We still define NeedsAgentInterventionError so imports don't fail,
+    # but we will skip starting servers or intercepting Playwright later.
+    pass
 
 # Define specific error for agent intervention
 class NeedsAgentInterventionError(Exception):
@@ -1599,18 +1602,6 @@ def _intercept_playwright():
     logger.info("Playwright interception activated")
 
 
-# Activate interception on module import
-try:
-    _intercept_playwright()
-except Exception as e:
-    logger.error(f"Failed to intercept Playwright: {e}", exc_info=True)
-
-# Start HTTP resume server (if enabled)
-try:
-    _start_resume_http_server()
-except Exception as e:
-    logger.error(f"Failed to start resume HTTP server: {e}")
-
 def _handle_exception(exc_type, exc_value, exc_traceback):
     """Global exception hook to catch NeedsAgentInterventionError."""
     
@@ -1664,4 +1655,18 @@ def _handle_exception(exc_type, exc_value, exc_traceback):
     # For all other cases, call the original excepthook (prints traceback and exits)
     sys.__excepthook__(exc_type, exc_value, exc_traceback)
 
-sys.excepthook = _handle_exception
+
+if _IS_MINIAGENT_ENABLED:
+    # Activate interception on module import
+    try:
+        _intercept_playwright()
+    except Exception as e:
+        logger.error(f"Failed to intercept Playwright: {e}", exc_info=True)
+
+    # Start HTTP resume server (if enabled)
+    try:
+        _start_resume_http_server()
+    except Exception as e:
+        logger.error(f"Failed to start resume HTTP server: {e}")
+
+    sys.excepthook = _handle_exception
