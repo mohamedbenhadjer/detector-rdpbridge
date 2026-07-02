@@ -249,47 +249,49 @@ def _get_process_tree():
     else:
         return _get_process_tree_windows()
 
-def _find_browser_pid(root_pid: int) -> Optional[int]:
+def _find_browser_pid(root_pid: int):
     """
     Find the main browser process ID that is a descendant of root_pid.
     We look for 'chrome', 'chromium', 'msedge' with no '--type=' argument (main process usually).
+    Returns a tuple (pid, cmdline).
     """
     tree, cmdlines = _get_process_tree()
-    
+
     # BFS traversal
     queue = [root_pid]
     candidates = []
-    
+
     # Safety: avoid infinite loops if cycle in tree (rare)
     visited = {root_pid}
-    
+
     while queue:
         current_pid = queue.pop(0)
-        
+
         # Check current process
-        cmd = cmdlines.get(current_pid, "").lower()
-        if any(x in cmd for x in ["chrome", "chromium", "msedge", "firefox", "webkit", "safari"]):
+        cmd = cmdlines.get(current_pid, "")
+        cmd_lower = cmd.lower()
+        if any(x in cmd_lower for x in ["chrome", "chromium", "msedge", "firefox", "webkit", "safari"]):
             # Heuristic: Main process usually doesn't have --type=renderer etc.
             # But Playwright launches wrapper scripts too.
             candidates.append((current_pid, cmd))
-            
+
         # Add children
         children = tree.get(current_pid, [])
         for child in children:
             if child not in visited:
                 visited.add(child)
                 queue.append(child)
-    
+
     if not candidates:
-        return None
-        
+        return None, ""
+
     # Filter for main process (no --type=)
     for pid, cmd in candidates:
-        if "--type=" not in cmd:
-            return pid
-            
+        if "--type=" not in cmd.lower():
+            return pid, cmd
+
     # Fallback: return the first candidate (closest to root)
-    return candidates[0][0]
+    return candidates[0]
 
 
 def _get_cdp_target_id(debug_port: int, page_url: str) -> Optional[str]:
@@ -1054,8 +1056,8 @@ def _intercept_playwright():
         has_debug = any("--remote-debugging-port" in str(arg) for arg in args)
         chosen_port = None
         if not has_debug:
-            # Find a free port dynamically
-            chosen_port = _find_free_debug_port(_DEBUG_PORT)
+            # Inject port 0, which lets the OS pick a free port, avoiding TOCTOU.
+            chosen_port = 0
             args.extend([
                 "--remote-debugging-address=127.0.0.1",
                 f"--remote-debugging-port={chosen_port}"
@@ -1113,11 +1115,24 @@ def _intercept_playwright():
             kwargs["args"], debug_port = _inject_debug_args([], browser_name)
         
         browser = _orig_sync_launch(self, *args, **kwargs)
-        
+
         # Store browser info with the actual debug port used
-        pid = _find_browser_pid(os.getpid())
-        
+        pid, cmdline = _find_browser_pid(os.getpid())
+
         if browser_name in ("chromium", "chrome", "msedge"):
+            # Check if we asked for dynamic port 0
+            if debug_port == 0 and pid:
+                import re, time
+                m = re.search(r'--user-data-dir=(?:"([^"]+)"|\'([^\']+)\'|([^\s]+))', cmdline)
+                if m:
+                    user_data_dir = m.group(1) or m.group(2) or m.group(3)
+                    for _ in range(20): # try for up to 2s
+                        detected = _read_devtools_port(Path(user_data_dir))
+                        if detected:
+                            debug_port = detected
+                            break
+                        time.sleep(0.1)
+
             _browser_info[id(browser)] = {
                 "browser": browser_name,
                 "debug_port": debug_port,
@@ -1158,23 +1173,27 @@ def _intercept_playwright():
             kwargs["args"], debug_port = _inject_debug_args([], browser_name)
         
         context = _orig_sync_launch_persistent(self, user_data_dir, *args, **kwargs)
-        
+
         # Set debug port for Chromium (use the port we chose)
         if browser_name in ("chromium", "chrome", "msedge"):
-            # Sanity check: read DevToolsActivePort file if available
             import time
-            time.sleep(0.5)  # Give Chrome time to write the file
-            detected_port = _read_devtools_port(Path(user_data_dir))
+            detected_port = None
+            for _ in range(20): # Try for up to 2 seconds
+                detected_port = _read_devtools_port(Path(user_data_dir))
+                if detected_port:
+                    break
+                time.sleep(0.1)
+
             if detected_port and detected_port != debug_port:
-                logger.warning(f"DevToolsActivePort mismatch: configured={debug_port}, detected={detected_port}")
-                # Use detected port if it differs (Chrome may have chosen different port)
+                if debug_port != 0:
+                    logger.warning(f"DevToolsActivePort mismatch: configured={debug_port}, detected={detected_port}")
                 debug_port = detected_port
-            
+
             logger.info(f"Chromium persistent context launched with debug port {debug_port}")
-        
+
         # Find browser PID
-        pid = _find_browser_pid(os.getpid())
-        
+        pid, _ = _find_browser_pid(os.getpid())
+
         _browser_info[id(context)] = {
             "browser": browser_name if browser_name in ("chromium", "firefox", "webkit") else "chromium",
             "debug_port": debug_port,
@@ -1220,11 +1239,25 @@ def _intercept_playwright():
             kwargs["args"], debug_port = _inject_debug_args([], browser_name)
         
         browser = await _orig_async_launch(self, *args, **kwargs)
-        
+
         # Store browser info with the actual debug port used
-        pid = _find_browser_pid(os.getpid())
-        
+        pid, cmdline = _find_browser_pid(os.getpid())
+
         if browser_name in ("chromium", "chrome", "msedge"):
+            # Check if we asked for dynamic port 0
+            if debug_port == 0 and pid:
+                import re
+                m = re.search(r'--user-data-dir=(?:"([^"]+)"|\'([^\']+)\'|([^\s]+))', cmdline)
+                if m:
+                    user_data_dir = m.group(1) or m.group(2) or m.group(3)
+                    import asyncio
+                    for _ in range(20): # try for up to 2s
+                        detected = _read_devtools_port(Path(user_data_dir))
+                        if detected:
+                            debug_port = detected
+                            break
+                        await asyncio.sleep(0.1)
+
             _browser_info[id(browser)] = {
                 "browser": browser_name,
                 "debug_port": debug_port,
@@ -1265,22 +1298,27 @@ def _intercept_playwright():
             kwargs["args"], debug_port = _inject_debug_args([], browser_name)
         
         context = await _orig_async_launch_persistent(self, user_data_dir, *args, **kwargs)
-        
+
         # Set debug port for Chromium (use the port we chose)
         if browser_name in ("chromium", "chrome", "msedge"):
-            # Sanity check: read DevToolsActivePort file if available
             import asyncio
-            await asyncio.sleep(0.5)  # Give Chrome time to write the file
-            detected_port = _read_devtools_port(Path(user_data_dir))
+            detected_port = None
+            for _ in range(20): # Try for up to 2 seconds
+                detected_port = _read_devtools_port(Path(user_data_dir))
+                if detected_port:
+                    break
+                await asyncio.sleep(0.1)
+
             if detected_port and detected_port != debug_port:
-                logger.warning(f"DevToolsActivePort mismatch: configured={debug_port}, detected={detected_port}")
+                if debug_port != 0:
+                    logger.warning(f"DevToolsActivePort mismatch: configured={debug_port}, detected={detected_port}")
                 debug_port = detected_port
-            
+
             logger.info(f"Chromium async persistent context launched with debug port {debug_port}")
-        
+
         # Find browser PID
-        pid = _find_browser_pid(os.getpid())
-        
+        pid, _ = _find_browser_pid(os.getpid())
+
         _browser_info[id(context)] = {
             "browser": browser_name if browser_name in ("chromium", "firefox", "webkit") else "chromium",
             "debug_port": debug_port,
