@@ -14,6 +14,7 @@ import socket
 import urllib.request
 import signal
 import atexit
+import weakref
 from pathlib import Path
 from typing import Optional, Any, Dict
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -68,6 +69,7 @@ builtins.NeedsAgentInterventionError = NeedsAgentInterventionError
 
 logger = logging.getLogger("miniagent.hook")
 logger.setLevel(logging.INFO)
+logger.propagate = False
 if not logger.handlers:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
@@ -76,8 +78,8 @@ if not logger.handlers:
 # Track if we've already patched
 _patched = False
 
-# Track browser info per launch
-_browser_info: Dict[int, Dict[str, Any]] = {}
+# Track browser info per launch using weak references so it gets garbage collected
+_browser_info: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 # Error handling mode configuration
 _MODE = os.environ.get("MINIAGENT_ON_ERROR", "report").lower()  # report|hold|swallow
@@ -444,8 +446,8 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
                     if hasattr(browser_ref, "browser") and browser_ref.browser:
                         browser_ref = browser_ref.browser
                     
-                    if id(browser_ref) in _browser_info:
-                         browser_pid = _browser_info[id(browser_ref)].get("pid")
+                    if browser_ref in _browser_info:
+                         browser_pid = _browser_info[browser_ref].get("pid")
                 
                 # Perform PID liveness check if we found one
                 if browser_pid:
@@ -512,15 +514,18 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
 def _handle_signal(signum, frame):
     """Handle termination signals (Ctrl+C, etc)."""
     logger.info(f"Signal {signum} received, cancelling support request...")
-    
+
     try:
         from miniagent_ws import get_support_manager
         manager = get_support_manager()
         if manager:
             manager.cancel_support_request("signal_received")
+            # Give a small moment for the socket send to flush
+            time.sleep(0.2)
+            manager.ws_client.close()
     except Exception:
         pass
-        
+
     # Exit cleanly
     sys.exit(signum)
 
@@ -532,11 +537,13 @@ def _handle_exit():
     try:
         from miniagent_ws import get_support_manager
         manager = get_support_manager()
-        if manager and manager.active_request_id:
-            logger.info("Script exiting with active support request, cancelling...")
-            manager.cancel_support_request("script_exited")
-            # Give a small moment for the socket send to flush if needed
-            time.sleep(0.2)
+        if manager:
+            if manager.active_request_id:
+                logger.info("Script exiting with active support request, cancelling...")
+                manager.cancel_support_request("script_exited")
+                # Give a small moment for the socket send to flush if needed
+                time.sleep(0.2)
+            manager.ws_client.close()
     except Exception:
         pass
 
@@ -903,11 +910,11 @@ def _get_support_context(page_obj=None) -> Dict[str, Any]:
         if page_obj and hasattr(page_obj, "context"):
             ctx = page_obj.context
             # Try via Browser → mapping
-            if hasattr(ctx, "browser") and ctx.browser and id(ctx.browser) in _browser_info:
-                browser_info = _browser_info[id(ctx.browser)]
-            # Persistent context path stores mapping by context id
-            elif id(ctx) in _browser_info:
-                browser_info = _browser_info[id(ctx)]
+            if hasattr(ctx, "browser") and ctx.browser and ctx.browser in _browser_info:
+                browser_info = _browser_info[ctx.browser]
+            # Persistent context path stores mapping by context
+            elif ctx in _browser_info:
+                browser_info = _browser_info[ctx]
         # Fallback: detect browser type off the object if needed
         elif page_obj and hasattr(page_obj, "_impl") and hasattr(page_obj._impl, "_browser_type"):
             bt_name = page_obj._impl._browser_type.name
@@ -1155,19 +1162,27 @@ def _intercept_playwright():
                             break
                         time.sleep(0.1)
 
-            _browser_info[id(browser)] = {
+            _browser_info[browser] = {
                 "browser": browser_name,
                 "debug_port": debug_port,
                 "pid": pid
             }
             logger.info(f"Chromium launched with debug port {debug_port}, PID {pid}")
         else:
-            _browser_info[id(browser)] = {
+            _browser_info[browser] = {
                 "browser": "firefox" if browser_name == "firefox" else "webkit",
                 "debug_port": None,
                 "pid": pid
             }
-        
+
+        # Attach explicit cleanup hook on disconnect
+        try:
+            def _cleanup_browser(*args, **kwargs):
+                _browser_info.pop(browser, None)
+            browser.on("disconnected", _cleanup_browser)
+        except Exception as e:
+            logger.debug(f"Could not attach disconnected cleanup hook: {e}")
+
         # Monitor for browser close
         try:
             from miniagent_ws import get_support_manager
@@ -1216,12 +1231,20 @@ def _intercept_playwright():
         # Find browser PID
         pid, _ = _find_browser_pid(os.getpid())
 
-        _browser_info[id(context)] = {
+        _browser_info[context] = {
             "browser": browser_name if browser_name in ("chromium", "firefox", "webkit") else "chromium",
             "debug_port": debug_port,
             "pid": pid
         }
-        
+
+        # Attach explicit cleanup hook on close
+        try:
+            def _cleanup_context(*args, **kwargs):
+                _browser_info.pop(context, None)
+            context.on("close", _cleanup_context)
+        except Exception as e:
+            logger.debug(f"Could not attach close cleanup hook: {e}")
+
         # Install popup prevention on persistent context
         _install_popup_prevention_on_context(context)
         # Install on any existing pages
@@ -1280,19 +1303,27 @@ def _intercept_playwright():
                             break
                         await asyncio.sleep(0.1)
 
-            _browser_info[id(browser)] = {
+            _browser_info[browser] = {
                 "browser": browser_name,
                 "debug_port": debug_port,
                 "pid": pid
             }
             logger.info(f"Chromium async launched with debug port {debug_port}, PID {pid}")
         else:
-            _browser_info[id(browser)] = {
+            _browser_info[browser] = {
                 "browser": "firefox" if browser_name == "firefox" else "webkit",
                 "debug_port": None,
                 "pid": pid
             }
-        
+
+        # Attach explicit cleanup hook on disconnect
+        try:
+            def _cleanup_browser_async(*args, **kwargs):
+                _browser_info.pop(browser, None)
+            browser.on("disconnected", _cleanup_browser_async)
+        except Exception as e:
+            logger.debug(f"Could not attach disconnected cleanup hook: {e}")
+
         # Monitor for browser close
         try:
             from miniagent_ws import get_support_manager
@@ -1341,12 +1372,20 @@ def _intercept_playwright():
         # Find browser PID
         pid, _ = _find_browser_pid(os.getpid())
 
-        _browser_info[id(context)] = {
+        _browser_info[context] = {
             "browser": browser_name if browser_name in ("chromium", "firefox", "webkit") else "chromium",
             "debug_port": debug_port,
             "pid": pid
         }
-        
+
+        # Attach explicit cleanup hook on close
+        try:
+            def _cleanup_context(*args, **kwargs):
+                _browser_info.pop(context, None)
+            context.on("close", _cleanup_context)
+        except Exception as e:
+            logger.debug(f"Could not attach close cleanup hook: {e}")
+
         # Install popup prevention on persistent context
         _install_popup_prevention_on_context_async(context)
         # Install on any existing pages
