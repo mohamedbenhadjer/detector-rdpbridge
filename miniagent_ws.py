@@ -271,40 +271,14 @@ class SupportRequestManager:
         self.lock = threading.Lock()
         
         # Generate a unique run ID for this process
-        self.run_id = str(uuid.uuid4())[:8]
+        self.run_id = str(uuid.uuid4())
         self.pid = os.getpid()
         
         # Track active request for cancellation
         self.active_request_id: Optional[str] = None
         self.active_page_id: Optional[str] = None
         self.active_request_lock = threading.Lock()
-        
-        self._setup_signal_handlers()
-    
-    def _setup_signal_handlers(self):
-        """Set up signal handlers to cancel pending requests on exit."""
-        def handler(signum, frame):
-            sig_name = "SIGINT" if signum == signal.SIGINT else "SIGTERM"
-            logger.info(f"Received {sig_name}, cancelling active support requests...")
-            
-            # Cancel support request
-            self.cancel_support_request("signal_received")
-            
-            # Close WebSocket
-            self.ws_client.close()
-            
-            # Exit
-            sys.exit(0)
-            
-        try:
-            signal.signal(signal.SIGINT, handler)
-            signal.signal(signal.SIGTERM, handler)
-            if hasattr(signal, "SIGHUP"):
-                signal.signal(signal.SIGHUP, handler)
-        except ValueError:
-            # Handles case where not running in main thread
-            logger.warning("Could not setup signal handlers (not main thread?)")
-    
+
     def monitor_browser_close(self, browser):
         """
         Attach a listener to the Playwright browser to cancel the request
