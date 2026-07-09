@@ -112,7 +112,7 @@ async def _run_browser(worker_id: int, debug_port: int, console, hold_time: floa
 
             # ── Open WS and keep it alive for hold duration ──────────────
             status["state"] = "sending_request"
-            run_id = str(uuid.uuid4())[:8]
+            run_id = str(uuid.uuid4())
             t0 = time.time()
             ws = None
 

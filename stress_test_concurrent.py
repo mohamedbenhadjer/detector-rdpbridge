@@ -64,7 +64,7 @@ async def _worker(worker_id: int, barrier: asyncio.Barrier | None, timeout: floa
     """Connect via pure WebSocket, authenticate, send support request."""
     import websockets
 
-    run_id = str(uuid.uuid4())[:8]
+    run_id = str(uuid.uuid4())
 
     # Wait for all workers in the same batch to be ready
     if barrier:
