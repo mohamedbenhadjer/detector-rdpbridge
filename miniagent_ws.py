@@ -181,6 +181,18 @@ class MiniAgentWSClient:
         self.connected = False
         self.authenticated = False
     
+    def _queue_pending_message(self, msg, insert_front=False):
+        """Add a message to the pending queue, capping at 10 to prevent OOM."""
+        if insert_front:
+            self.pending_messages.insert(0, msg)
+        else:
+            self.pending_messages.append(msg)
+            
+        # Cap at 10 messages, dropping the oldest if necessary
+        if len(self.pending_messages) > 10:
+            dropped = self.pending_messages.pop(0)
+            logger.warning(f"Pending messages queue full (cap=10), dropping oldest message of type: {dropped.get('type')}")
+    
     def _flush_pending(self):
         """Send any pending messages after authentication."""
         with self.lock:
@@ -194,7 +206,7 @@ class MiniAgentWSClient:
                     logger.debug(f"Sent pending message: {msg.get('type')}")
                 except Exception as e:
                     logger.error(f"Failed to send pending message: {e}")
-                    self.pending_messages.insert(0, msg)
+                    self._queue_pending_message(msg, insert_front=True)
                     break
     
     def send_status_check(self, run_id: str):
@@ -211,10 +223,10 @@ class MiniAgentWSClient:
                     logger.debug(f"Sent status check for runId: {run_id}")
                 except Exception as e:
                     logger.error(f"Failed to send status check: {e}")
-                    self.pending_messages.append(msg)
+                    self._queue_pending_message(msg)
             else:
                 logger.debug("Not authenticated yet, buffering status check")
-                self.pending_messages.append(msg)
+                self._queue_pending_message(msg)
 
     def send_support_request(self, payload: Dict[str, Any]):
         """
@@ -235,10 +247,10 @@ class MiniAgentWSClient:
                     logger.info(f"Sent support request: {payload.get('description', 'N/A')[:80]}")
                 except Exception as e:
                     logger.error(f"Failed to send support request: {e}")
-                    self.pending_messages.append(msg)
+                    self._queue_pending_message(msg)
             else:
                 logger.info("Not authenticated yet, buffering support request")
-                self.pending_messages.append(msg)
+                self._queue_pending_message(msg)
     
     def send_support_cancelled(self, payload: Dict[str, Any]):
         """
@@ -256,10 +268,10 @@ class MiniAgentWSClient:
                     logger.info(f"Sent cancellation: {payload.get('reason', 'N/A')}")
                 except Exception as e:
                     logger.error(f"Failed to send cancellation: {e}")
-                    self.pending_messages.append(msg)
+                    self._queue_pending_message(msg)
             else:
                 logger.info("Not authenticated yet, buffering cancellation")
-                self.pending_messages.append(msg)
+                self._queue_pending_message(msg)
     
     def close(self):
         """Close the WebSocket connection."""
