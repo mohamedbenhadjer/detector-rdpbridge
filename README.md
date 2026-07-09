@@ -537,10 +537,9 @@ For Chromium, the hook automatically injects `--remote-debugging-port` flags by 
 - `MINIAGENT_FORCE_DEBUG_PORT=1` (default) - Override any user-provided debug port args
 
 **Dynamic port allocation:**
-- The hook uses `_find_free_debug_port()` to automatically find an available port starting from `MINIAGENT_DEBUG_PORT`
-- If port 9222 is in use, it tries 9223, 9224, etc. (up to 50 attempts)
-- This allows multiple Chromium instances to run concurrently without port conflicts
-- The actual chosen port is included in the support request payload's `controlTarget.debugPort`
+- The hook uses OS-assigned ephemeral ports (port `0`) by default to automatically find an available port.
+- This allows multiple Chromium instances to run concurrently without port conflicts and avoids TOCTOU race conditions.
+- The actual chosen port is read from the `DevToolsActivePort` file and included in the support request payload's `controlTarget.debugPort`.
 
 **Verify CDP is active:**
 ```bash

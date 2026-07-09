@@ -284,46 +284,27 @@ If missing, check error messages.
 
 **Symptoms**: `controlTarget.debugPort` is null/missing for Chromium
 
-**Note**: Since v2.0, the hook forces port 9222 by default, so this should rarely occur.
+**Note**: The hook uses OS-assigned ephemeral ports (port 0) by default to prevent collisions.
 
 **Diagnosis**:
 ```bash
-# Verify Chromium is listening on port 9222
-curl http://127.0.0.1:9222/json/version
-
-# Check if port is in use
-lsof -i :9222  # Linux/Mac
-netstat -an | findstr 9222  # Windows
+# Check the DevToolsActivePort file in your user data directory
+cat /path/to/user/data/dir/DevToolsActivePort
 ```
 
 **Causes & Solutions**:
 
-1. **Port already in use**
-   - Another Chromium instance or process is using port 9222
-   - Solution: Kill the process or use a different port via `MINIAGENT_DEBUG_PORT`
+1. **TOCTOU or timing issues**
+   - The file might not have been created fast enough before the hook checked it.
+   - Solution: The hook already retries reading it. If this fails consistently, check if your script passes a very strange `--user-data-dir`.
 
 2. **Force disabled**
    - If you set `MINIAGENT_FORCE_DEBUG_PORT=0`, the hook won't override user args
    - Solution: Ensure you're providing `--remote-debugging-port` in your script
 
 3. **Firewall blocking**
-   - Localhost firewall rules blocking 127.0.0.1:9222
+   - Localhost firewall rules blocking 127.0.0.1
    - Solution: Allow localhost connections or disable firewall for testing
-
----
-
-### "Port 9222 already in use"
-
-**Symptoms**: Chromium fails to launch or launches without debug port
-
-**Diagnosis**:
-```bash
-# Find what's using port 9222
-lsof -i :9222  # Linux/Mac
-netstat -ano | findstr 9222  # Windows
-```
-
-**Solutions**:
 
 1. **Kill existing Chromium instance**
    ```bash
