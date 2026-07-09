@@ -10,6 +10,7 @@ import time
 import uuid
 import signal
 import sys
+import random
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Set, Tuple
 import threading
@@ -62,11 +63,13 @@ class MiniAgentWSClient:
             try:
                 now = time.time()
                 if now - self.last_connect_attempt < self.reconnect_delay:
-                    time.sleep(self.reconnect_delay - (now - self.last_connect_attempt))
-                
+                    actual_delay = self.reconnect_delay - (now - self.last_connect_attempt)
+                    jittered_delay = actual_delay * (0.5 + random.random())
+                    time.sleep(jittered_delay)
+
                 self.last_connect_attempt = time.time()
                 logger.debug(f"Connecting to {self.ws_url}...")
-                
+
                 self.ws = WebSocketApp(
                     self.ws_url,
                     on_open=self._on_open,
@@ -74,14 +77,15 @@ class MiniAgentWSClient:
                     on_error=self._on_error,
                     on_close=self._on_close
                 )
-                
+
                 self.ws.run_forever()
-                
+
             except Exception as e:
                 logger.error(f"WebSocket error: {e}")
-            
+
             # Backoff before reconnecting
-            time.sleep(self.reconnect_delay)
+            jittered_delay = self.reconnect_delay * (0.5 + random.random())
+            time.sleep(jittered_delay)
             self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
     
     def _on_open(self, ws):
@@ -142,12 +146,16 @@ class MiniAgentWSClient:
                 error_code = data.get("code")
                 error_msg = data.get("message", "Unknown error")
                 logger.error(f"Server error received: {error_code} - {error_msg}")
-                
+
                 if error_code == "BAD_AUTH":
                     logger.error("Authentication failed - check MINIAGENT_TOKEN")
                     self.authenticated = False
                 elif error_code == "NO_USER":
                     logger.warning("No signed-in user - will retry later")
+                elif error_code == "SERVER_BUSY":
+                    logger.warning("Server is busy - backing off")
+                    if ws:
+                        ws.close()
             
             elif msg_type == "pong":
                 # Heartbeat response - debug level only
@@ -234,13 +242,13 @@ class MiniAgentWSClient:
     
     def send_support_cancelled(self, payload: Dict[str, Any]):
         """
-        Send a cancellation message for a support request. 
+        Send a cancellation message for a support request.
         """
         msg = {
             "type": "support_cancelled",
             "payload": payload
         }
-        
+
         with self.lock:
             if self.authenticated and self.ws:
                 try:
@@ -248,9 +256,10 @@ class MiniAgentWSClient:
                     logger.info(f"Sent cancellation: {payload.get('reason', 'N/A')}")
                 except Exception as e:
                     logger.error(f"Failed to send cancellation: {e}")
-                    # No buffering for cancellation - if it fails, it fails
+                    self.pending_messages.append(msg)
             else:
-                logger.info("Not authenticated, cannot send cancellation")
+                logger.info("Not authenticated yet, buffering cancellation")
+                self.pending_messages.append(msg)
     
     def close(self):
         """Close the WebSocket connection."""
