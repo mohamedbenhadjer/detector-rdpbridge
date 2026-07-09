@@ -548,7 +548,6 @@ def _handle_exit():
         pass
 
 
-atexit.register(_handle_exit)
 
 
 class _ResumeRequestHandler(BaseHTTPRequestHandler):
@@ -1852,6 +1851,7 @@ def _handle_exception(exc_type, exc_value, exc_traceback):
 if _IS_MINIAGENT_ENABLED:
     # Activate interception on module import
     try:
+        atexit.register(_handle_exit)
         _intercept_playwright()
     except Exception as e:
         logger.error(f"Failed to intercept Playwright: {e}", exc_info=True)
