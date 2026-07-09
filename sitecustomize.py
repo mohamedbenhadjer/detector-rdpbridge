@@ -402,13 +402,10 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
     browser_or_context = None
 
     if page_obj:
-        try:
-            if hasattr(page_obj, "context"):
-                browser_or_context = page_obj.context
-                if hasattr(browser_or_context, "browser") and browser_or_context.browser:
-                    browser_or_context = browser_or_context.browser
-        except:
-            pass
+        if hasattr(page_obj, "context"):
+            browser_or_context = page_obj.context
+            if hasattr(browser_or_context, "browser") and browser_or_context.browser:
+                browser_or_context = browser_or_context.browser
     
     
     
@@ -905,22 +902,19 @@ def _get_support_context(page_obj=None) -> Dict[str, Any]:
     
     # Get browser info
     browser_info = {"browser": "chromium", "debug_port": None}
-    try:
-        if page_obj and hasattr(page_obj, "context"):
-            ctx = page_obj.context
-            # Try via Browser → mapping
-            if hasattr(ctx, "browser") and ctx.browser and ctx.browser in _browser_info:
-                browser_info = _browser_info[ctx.browser]
-            # Persistent context path stores mapping by context
-            elif ctx in _browser_info:
-                browser_info = _browser_info[ctx]
-        # Fallback: detect browser type off the object if needed
-        elif page_obj and hasattr(page_obj, "_impl") and hasattr(page_obj._impl, "_browser_type"):
-            bt_name = page_obj._impl._browser_type.name
-            browser_info["browser"] = bt_name if bt_name in ("firefox", "webkit") else "chromium"
-            browser_info["pid"] = None # Can't easily determine pid in fallback
-    except Exception:
-        pass
+    if page_obj and hasattr(page_obj, "context"):
+        ctx = page_obj.context
+        # Try via Browser → mapping
+        if hasattr(ctx, "browser") and ctx.browser and ctx.browser in _browser_info:
+            browser_info = _browser_info[ctx.browser]
+        # Persistent context path stores mapping by context
+        elif ctx in _browser_info:
+            browser_info = _browser_info[ctx]
+    # Fallback: detect browser type off the object if needed
+    elif page_obj and hasattr(page_obj, "_impl") and hasattr(page_obj._impl, "_browser_type"):
+        bt_name = page_obj._impl._browser_type.name
+        browser_info["browser"] = bt_name if bt_name in ("firefox", "webkit") else "chromium"
+        browser_info["pid"] = None # Can't easily determine pid in fallback
     
     # Try to resolve CDP Target ID for Chromium browsers
     cdp_target_id = None
