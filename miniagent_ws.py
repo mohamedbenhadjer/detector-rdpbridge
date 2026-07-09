@@ -78,7 +78,7 @@ class MiniAgentWSClient:
                     on_close=self._on_close
                 )
 
-                self.ws.run_forever()
+                self.ws.run_forever(ping_interval=30, ping_timeout=10)
 
             except Exception as e:
                 logger.error(f"WebSocket error: {e}")
