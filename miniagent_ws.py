@@ -8,7 +8,6 @@ import logging
 import os
 import time
 import uuid
-import signal
 import sys
 import random
 from datetime import datetime, timezone
