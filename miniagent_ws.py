@@ -129,13 +129,20 @@ class MiniAgentWSClient:
                 run_id = data.get("runId")
                 status = data.get("status")
                 logger.info(f"Status check result for {run_id}: {status}")
-                if status in ["completed", "failed", "cancelled", "noAgents", "error", "unknown"]:
+                # "failed" is NOT terminal for the hold loop: the host may create
+                # a retry child and a new agent will share/resume this same runId.
+                # Exiting on failed was killing Playwright during retry.
+                if status in ["completed", "cancelled", "noAgents", "error", "unknown"]:
                     if _support_manager and _support_manager.active_request_id == run_id:
                         logger.info(f"Request {run_id} is {status}, cancelling locally.")
                         with _support_manager.active_request_lock:
                             _support_manager.should_exit_hold = True
                             _support_manager.active_request_id = None
                             _support_manager.active_page_id = None
+                elif status == "failed":
+                    logger.info(
+                        f"Request {run_id} is failed — keeping hold for possible host retry/resume"
+                    )
 
             elif msg_type == "support_request_ack":
                 request_id = data.get("requestId")
