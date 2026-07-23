@@ -425,8 +425,11 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
         except Exception as e:
             logger.debug(f"Error checking resume file: {e}")
             
-        # Check if request was cancelled (e.g. by signal or browser close callback)
-        if manager and not manager.active_request_id:
+        # Check if request was cancelled (e.g. by signal or browser close callback).
+        # Prefer should_exit_hold so we exit even if cancel is still buffered (H12).
+        if manager and (
+            getattr(manager, 'should_exit_hold', False) or not manager.active_request_id
+        ):
             logger.info("Support request cancelled; exiting hold.")
             sys.exit(1)
             
@@ -489,6 +492,7 @@ def _park_until_resume(reason: str, details: str, page_obj=None):
                 elif time.time() - manager._disconnect_start_time > 60.0:
                     logger.info("WebSocket disconnected for over 60s; exiting hold.")
                     with manager.active_request_lock:
+                        manager.should_exit_hold = True
                         manager.active_request_id = None
                     sys.exit(1)
             else:
@@ -1155,6 +1159,9 @@ def _intercept_playwright():
                             break
                         time.sleep(0.1)
 
+            if debug_port == 0:
+                debug_port = None
+
             _browser_info[browser] = {
                 "browser": browser_name,
                 "debug_port": debug_port,
@@ -1219,6 +1226,8 @@ def _intercept_playwright():
                     logger.warning(f"DevToolsActivePort mismatch: configured={debug_port}, detected={detected_port}")
                 debug_port = detected_port
 
+            if debug_port == 0:
+                debug_port = None
             logger.info(f"Chromium persistent context launched with debug port {debug_port}")
 
         # Find browser PID
@@ -1360,6 +1369,8 @@ def _intercept_playwright():
                     logger.warning(f"DevToolsActivePort mismatch: configured={debug_port}, detected={detected_port}")
                 debug_port = detected_port
 
+            if debug_port == 0:
+                debug_port = None
             logger.info(f"Chromium async persistent context launched with debug port {debug_port}")
 
         # Find browser PID
@@ -1700,9 +1711,15 @@ def _intercept_playwright():
                     
                     # Handle based on mode (only for NeedsAgentInterventionError)
                     if _MODE == "hold":
-                        # Async park until resume/timeout
+                        # Async park until resume/timeout/cancel (parity with sync hold)
                         logger.warning(f"Holding on error ({error_type}) - waiting for agent. Resume file: {_RESUME_FILE}")
                         deadline = _hold_deadline()
+                        page_obj = page
+                        browser_or_context = None
+                        if page_obj and hasattr(page_obj, "context"):
+                            browser_or_context = page_obj.context
+                            if hasattr(browser_or_context, "browser") and browser_or_context.browser:
+                                browser_or_context = browser_or_context.browser
                         while True:
                             try:
                                 if _RESUME_FILE and Path(_RESUME_FILE).exists():
@@ -1717,14 +1734,50 @@ def _intercept_playwright():
                             if deadline and time.time() >= deadline:
                                 logger.info("Hold timeout reached; continuing.")
                                 return None
-                                
-                            # Check if page is closed - handled by event listener now
-                            # But we keep a check just in case the event listener failed or wasn't attached
-                            # However, user requested to make it like "when no hold is there"
-                            # The event listener in SupportRequestManager calls cancel_support_request
-                            # which sets active_request_id to None, helping us exit the loop.
-                            pass
-                                    
+
+                            if manager and (
+                                getattr(manager, 'should_exit_hold', False)
+                                or not manager.active_request_id
+                            ):
+                                logger.info("Support request cancelled; exiting async hold.")
+                                sys.exit(1)
+
+                            browser_pid = None
+                            if browser_or_context and browser_or_context in _browser_info:
+                                browser_pid = _browser_info[browser_or_context].get("pid")
+                            if browser_pid:
+                                try:
+                                    os.kill(browser_pid, 0)
+                                except OSError:
+                                    logger.info(
+                                        f"Browser process {browser_pid} is gone; cancelling support request."
+                                    )
+                                    manager.cancel_support_request("browser_closed")
+                                    sys.exit(1)
+                            elif browser_or_context and hasattr(browser_or_context, "is_connected"):
+                                try:
+                                    if not browser_or_context.is_connected():
+                                        logger.info(
+                                            "Browser disconnected during async hold; cancelling."
+                                        )
+                                        manager.cancel_support_request("browser_closed")
+                                        sys.exit(1)
+                                except Exception:
+                                    pass
+
+                            if manager and hasattr(manager, 'ws_client') and manager.ws_client:
+                                if not getattr(manager.ws_client, 'connected', True):
+                                    if not hasattr(manager, '_disconnect_start_time') or manager._disconnect_start_time is None:
+                                        manager._disconnect_start_time = time.time()
+                                    elif time.time() - manager._disconnect_start_time > 60.0:
+                                        logger.info("WebSocket disconnected for over 60s; exiting async hold.")
+                                        with manager.active_request_lock:
+                                            manager.should_exit_hold = True
+                                            manager.active_request_id = None
+                                        sys.exit(1)
+                                else:
+                                    manager._disconnect_start_time = None
+
                             await asyncio.sleep(1.0)
                     
                     if _MODE == "swallow":

@@ -133,6 +133,7 @@ class MiniAgentWSClient:
                     if _support_manager and _support_manager.active_request_id == run_id:
                         logger.info(f"Request {run_id} is {status}, cancelling locally.")
                         with _support_manager.active_request_lock:
+                            _support_manager.should_exit_hold = True
                             _support_manager.active_request_id = None
                             _support_manager.active_page_id = None
 
@@ -152,7 +153,9 @@ class MiniAgentWSClient:
                 elif error_code == "NO_USER":
                     logger.warning("No signed-in user - will retry later")
                 elif error_code == "SERVER_BUSY":
-                    logger.warning("Server is busy - backing off")
+                    logger.warning("Server is busy - backing off (min 4s)")
+                    # Ensure at least 4s before retry under sustained overload (H13).
+                    self.reconnect_delay = max(self.reconnect_delay, 4.0)
                     if ws:
                         ws.close()
             
@@ -181,16 +184,32 @@ class MiniAgentWSClient:
         self.authenticated = False
     
     def _queue_pending_message(self, msg, insert_front=False):
-        """Add a message to the pending queue, capping at 10 to prevent OOM."""
-        if insert_front:
+        """Add a message to the pending queue, capping at 10 to prevent OOM.
+
+        Cancellations are never dropped: if the queue is full, drop the oldest
+        non-cancel message instead (H12).
+        """
+        is_cancel = msg.get("type") == "support_cancelled"
+        # Cancels always go to the front so they flush first.
+        if insert_front or is_cancel:
             self.pending_messages.insert(0, msg)
         else:
             self.pending_messages.append(msg)
-            
-        # Cap at 10 messages, dropping the oldest if necessary
-        if len(self.pending_messages) > 10:
-            dropped = self.pending_messages.pop(0)
-            logger.warning(f"Pending messages queue full (cap=10), dropping oldest message of type: {dropped.get('type')}")
+
+        while len(self.pending_messages) > 10:
+            drop_idx = None
+            for i, pending in enumerate(self.pending_messages):
+                if pending.get("type") != "support_cancelled":
+                    drop_idx = i
+                    break
+            if drop_idx is None:
+                # Only cancels remain; keep them all (allow slight over-cap).
+                break
+            dropped = self.pending_messages.pop(drop_idx)
+            logger.warning(
+                f"Pending messages queue full (cap=10), dropping oldest non-cancel "
+                f"message of type: {dropped.get('type')}"
+            )
     
     def _flush_pending(self):
         """Send any pending messages after authentication."""
@@ -297,6 +316,7 @@ class SupportRequestManager:
         # Track active request for cancellation
         self.active_request_id: Optional[str] = None
         self.active_page_id: Optional[str] = None
+        self.should_exit_hold = False
         self.active_request_lock = threading.Lock()
 
     def monitor_browser_close(self, browser):
@@ -369,7 +389,8 @@ class SupportRequestManager:
         
         control_target = {"browser": browser}
         
-        if debug_port is not None:
+        # Never publish debugPort: 0 (unresolved ephemeral port).
+        if debug_port is not None and debug_port != 0:
             control_target["debugPort"] = debug_port
         
         if cdp_target_id is not None:
@@ -415,6 +436,7 @@ class SupportRequestManager:
         with self.active_request_lock:
             self.active_request_id = self.run_id
             self.active_page_id = page_id
+            self.should_exit_hold = False
 
         self.ws_client.send_support_request(payload)
 
@@ -438,9 +460,14 @@ class SupportRequestManager:
                 "ts": datetime.now(timezone.utc).isoformat()
             }
 
+            # Signal hold loops to exit even if cancel is still buffered (H12).
+            self.should_exit_hold = True
             self.ws_client.send_support_cancelled(payload)
-            self.active_request_id = None
+            # Keep active_request_id until cancel is queued/sent; clear page binding.
+            # Hold loops key off should_exit_hold, not a premature None id.
             self.active_page_id = None
+            # Clear id after send/queue so status_check paths do not keep a live request.
+            self.active_request_id = None
 
 
 # Global singleton instances
